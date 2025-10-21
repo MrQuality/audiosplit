@@ -1,0 +1,12 @@
+[package]
+name = "audiosplit"
+version = "0.1.0"
+edition = "2021"
+authors = ["AudioSplit Contributors"]
+license = "MIT"
+
+[dependencies]
+audiosplit_core = { path = "../audiosplit_core" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+env_logger = "0.10"
