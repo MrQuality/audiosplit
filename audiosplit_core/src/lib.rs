@@ -14,7 +14,7 @@ use symphonia::default::{get_codecs, get_formats, get_probe};
 use thiserror::Error;
 
 /// Maximum number of segments produced from a single input file.
-const MAX_SEGMENTS: u64 = 10_000;
+const MAX_SEGMENTS: u64 = 50_000;
 
 /// Errors that can occur while splitting audio files.
 #[derive(Debug, Error)]
@@ -37,7 +37,7 @@ pub enum AudioSplitError {
 
     /// Error returned when the number of generated segments exceeds the supported limit.
     #[error("segment limit of {limit} exceeded")]
-    SegmentLimit { limit: u64 },
+    SegmentLimitExceeded { limit: u64 },
 
     /// Error returned when the decoder track lacks a sample rate.
     #[error("input stream does not advertise a sample rate")]
@@ -86,6 +86,10 @@ impl Config {
 
         let input_path = fs::canonicalize(input_ref)
             .map_err(|_| AudioSplitError::InvalidPath(input_ref.to_path_buf()))?;
+
+        fs::create_dir_all(output_ref)
+            .map_err(|_| AudioSplitError::InvalidPath(output_ref.to_path_buf()))?;
+
         let output_dir = fs::canonicalize(output_ref)
             .map_err(|_| AudioSplitError::InvalidPath(output_ref.to_path_buf()))?;
 
@@ -103,6 +107,30 @@ impl Config {
             segment_length_ms,
             postfix: postfix.into(),
         })
+    }
+}
+
+fn frames_to_milliseconds(frames: u64, sample_rate: u64) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+
+    (frames.saturating_mul(1000) + sample_rate - 1) / sample_rate
+}
+
+fn ensure_segment_limit(duration_ms: u64, segment_length_ms: u64) -> Result<(), AudioSplitError> {
+    if segment_length_ms == 0 {
+        return Err(AudioSplitError::ZeroDuration);
+    }
+
+    let total_segments = (duration_ms + segment_length_ms - 1) / segment_length_ms;
+
+    if total_segments > MAX_SEGMENTS {
+        Err(AudioSplitError::SegmentLimitExceeded {
+            limit: MAX_SEGMENTS,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -140,11 +168,17 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         return Err(AudioSplitError::ZeroDuration);
     }
 
+    if let Some(total_frames) = track.codec_params.n_frames {
+        let duration_ms = frames_to_milliseconds(total_frames, sample_rate);
+        ensure_segment_limit(duration_ms, config.segment_length_ms)?;
+    }
+
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
     let mut packets = VecDeque::new();
     let mut frames_in_segment: u64 = 0;
     let mut segment_index: u64 = 0;
+    let mut total_frames_processed: u64 = 0;
 
     let base_name = config
         .input_path
@@ -171,6 +205,8 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 frames_in_segment += decoded.frames() as u64;
+                total_frames_processed =
+                    total_frames_processed.saturating_add(decoded.frames() as u64);
                 packets.push_back(packet_ref);
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
@@ -179,7 +215,7 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
 
         if frames_in_segment >= segment_length_frames {
             if segment_index >= MAX_SEGMENTS {
-                return Err(AudioSplitError::SegmentLimit {
+                return Err(AudioSplitError::SegmentLimitExceeded {
                     limit: MAX_SEGMENTS,
                 });
             }
@@ -201,7 +237,7 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
 
     if !packets.is_empty() {
         if segment_index >= MAX_SEGMENTS {
-            return Err(AudioSplitError::SegmentLimit {
+            return Err(AudioSplitError::SegmentLimitExceeded {
                 limit: MAX_SEGMENTS,
             });
         }
@@ -217,6 +253,9 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
             &packets,
         )?;
     }
+
+    let duration_ms = frames_to_milliseconds(total_frames_processed, sample_rate);
+    ensure_segment_limit(duration_ms, config.segment_length_ms)?;
 
     Ok(())
 }
@@ -252,6 +291,10 @@ fn write_segment(
     let mut output_path = config.output_dir.clone();
     output_path.push(file_name);
 
+    if !output_path.starts_with(&config.output_dir) {
+        return Err(AudioSplitError::InvalidPath(output_path));
+    }
+
     let mut output = File::create(&output_path)?;
     let mut writer = get_formats().get(probed_format_type(params))?.write(
         &mut output,
@@ -269,4 +312,45 @@ fn write_segment(
 
 fn probed_format_type(params: &CodecParameters) -> symphonia::core::formats::FormatId {
     params.codec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use tempfile::tempdir;
+
+    #[test]
+    fn config_new_rejects_non_directory_output() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_file = temp_dir.path().join("output_file");
+        File::create(&output_file).expect("create output file");
+
+        let err = Config::new(&input_path, &output_file, 1_000, "part")
+            .expect_err("expected invalid output directory error");
+
+        match err {
+            AudioSplitError::InvalidPath(path) => assert_eq!(path, output_file),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_limit_rejection_from_duration() {
+        let segment_length_ms = 1_000;
+        let duration_ms = MAX_SEGMENTS
+            .saturating_mul(segment_length_ms)
+            .saturating_add(1);
+
+        let err = ensure_segment_limit(duration_ms, segment_length_ms)
+            .expect_err("expected segment limit rejection");
+
+        match err {
+            AudioSplitError::SegmentLimitExceeded { limit } => assert_eq!(limit, MAX_SEGMENTS),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }
