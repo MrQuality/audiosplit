@@ -317,8 +317,70 @@ fn probed_format_type(params: &CodecParameters) -> symphonia::core::formats::For
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
+    use std::fs::{self, File};
     use tempfile::tempdir;
+
+    #[test]
+    fn frames_to_milliseconds_rounds_up_partial_frame() {
+        assert_eq!(frames_to_milliseconds(48_001, 48_000), 1_001);
+    }
+
+    #[test]
+    fn frames_to_milliseconds_returns_zero_for_zero_rate() {
+        assert_eq!(frames_to_milliseconds(1_000, 0), 0);
+    }
+
+    #[test]
+    fn ensure_segment_limit_allows_exact_fit() {
+        let segment_length_ms = 1_000;
+        let duration_ms = MAX_SEGMENTS.saturating_mul(segment_length_ms);
+
+        ensure_segment_limit(duration_ms, segment_length_ms)
+            .expect("duration exactly divisible by segment length should pass");
+    }
+
+    #[test]
+    fn ensure_segment_limit_counts_partial_segment() {
+        let segment_length_ms = 1_000;
+        let duration_ms = segment_length_ms * 2 + 1;
+
+        ensure_segment_limit(duration_ms, segment_length_ms)
+            .expect("partial segments should still be within the limit");
+    }
+
+    #[test]
+    fn num_width_increases_with_value() {
+        assert_eq!(num_width(0), 1);
+        assert_eq!(num_width(7), 1);
+        assert_eq!(num_width(10), 2);
+        assert_eq!(num_width(1_001), 4);
+    }
+
+    #[test]
+    fn config_new_rejects_zero_length() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let err = Config::new(&input_path, temp_dir.path(), 0, "part")
+            .expect_err("expected zero duration rejection");
+
+        assert!(matches!(err, AudioSplitError::ZeroDuration));
+    }
+
+    #[test]
+    fn config_new_rejects_missing_input() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let missing_input = temp_dir.path().join("missing.wav");
+
+        let err = Config::new(&missing_input, temp_dir.path(), 1_000, "part")
+            .expect_err("expected invalid input path error");
+
+        match err {
+            AudioSplitError::InvalidPath(path) => assert_eq!(path, missing_input),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 
     #[test]
     fn config_new_rejects_non_directory_output() {
@@ -336,6 +398,25 @@ mod tests {
             AudioSplitError::InvalidPath(path) => assert_eq!(path, output_file),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_new_canonicalizes_paths() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let nested_dir = temp_dir.path().join("nested");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+        let input_path = nested_dir.join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = nested_dir.join("output");
+
+        let config = Config::new(&input_path, &output_dir, 500, "demo")
+            .expect("config should be constructed");
+
+        assert!(config.input_path.is_absolute());
+        assert!(config.output_dir.is_absolute());
+        assert_eq!(config.segment_length_ms, 500);
+        assert_eq!(config.postfix, "demo");
     }
 
     #[test]
