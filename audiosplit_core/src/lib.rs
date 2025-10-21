@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-
-use log::info;
 use symphonia::core::audio::Signal;
 use symphonia::core::codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -15,13 +13,12 @@ use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_formats, get_probe};
 use thiserror::Error;
 
+/// Maximum number of segments produced from a single input file.
+const MAX_SEGMENTS: u64 = 10_000;
+
 /// Errors that can occur while splitting audio files.
 #[derive(Debug, Error)]
 pub enum AudioSplitError {
-    /// Generic error returned when the functionality is not yet implemented.
-    #[error("audio splitting is not yet implemented")]
-    Unimplemented,
-
     /// Wrapper around errors produced by the Symphonia decoding library.
     #[error(transparent)]
     Symphonia(#[from] SymphoniaError),
@@ -29,6 +26,18 @@ pub enum AudioSplitError {
     /// Wrapper around IO errors encountered while reading or writing files.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// Error returned when the provided path cannot be resolved.
+    #[error("invalid path: {0}")]
+    InvalidPath(PathBuf),
+
+    /// Error returned when the requested segment duration is zero.
+    #[error("segment length must be greater than zero milliseconds")]
+    ZeroDuration,
+
+    /// Error returned when the number of generated segments exceeds the supported limit.
+    #[error("segment limit of {limit} exceeded")]
+    SegmentLimit { limit: u64 },
 
     /// Error returned when the decoder track lacks a sample rate.
     #[error("input stream does not advertise a sample rate")]
@@ -41,10 +50,6 @@ pub enum AudioSplitError {
     /// Error returned when the codec of the track cannot be handled.
     #[error("unsupported codec")]
     UnsupportedCodec,
-
-    /// Error returned when the segment length is invalid.
-    #[error("segment length must be greater than zero milliseconds")]
-    InvalidSegmentLength,
 
     /// Error produced when a file name cannot be derived from the input path.
     #[error("failed to derive a base name for the input file")]
@@ -73,11 +78,24 @@ impl Config {
         postfix: S,
     ) -> Result<Self, AudioSplitError> {
         if segment_length_ms == 0 {
-            return Err(AudioSplitError::InvalidSegmentLength);
+            return Err(AudioSplitError::ZeroDuration);
         }
 
-        let input_path = fs::canonicalize(input)?;
-        let output_dir = fs::canonicalize(output)?;
+        let input_ref = input.as_ref();
+        let output_ref = output.as_ref();
+
+        let input_path = fs::canonicalize(input_ref)
+            .map_err(|_| AudioSplitError::InvalidPath(input_ref.to_path_buf()))?;
+        let output_dir = fs::canonicalize(output_ref)
+            .map_err(|_| AudioSplitError::InvalidPath(output_ref.to_path_buf()))?;
+
+        if !input_path.is_file() {
+            return Err(AudioSplitError::InvalidPath(input_path));
+        }
+
+        if !output_dir.is_dir() {
+            return Err(AudioSplitError::InvalidPath(output_dir));
+        }
 
         Ok(Self {
             input_path,
@@ -119,7 +137,7 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         .ok_or(AudioSplitError::MissingSampleRate)? as u64;
     let segment_length_frames = (sample_rate * config.segment_length_ms + 999) / 1000;
     if segment_length_frames == 0 {
-        return Err(AudioSplitError::InvalidSegmentLength);
+        return Err(AudioSplitError::ZeroDuration);
     }
 
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
@@ -160,6 +178,11 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         }
 
         if frames_in_segment >= segment_length_frames {
+            if segment_index >= MAX_SEGMENTS {
+                return Err(AudioSplitError::SegmentLimit {
+                    limit: MAX_SEGMENTS,
+                });
+            }
             segment_index += 1;
             pad_width = pad_width.max(num_width(segment_index));
             write_segment(
@@ -177,6 +200,11 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
     }
 
     if !packets.is_empty() {
+        if segment_index >= MAX_SEGMENTS {
+            return Err(AudioSplitError::SegmentLimit {
+                limit: MAX_SEGMENTS,
+            });
+        }
         segment_index += 1;
         pad_width = pad_width.max(num_width(segment_index));
         write_segment(
@@ -241,18 +269,4 @@ fn write_segment(
 
 fn probed_format_type(params: &CodecParameters) -> symphonia::core::formats::FormatId {
     params.codec
-}
-
-/// Split an input audio file into multiple tracks written to the output directory.
-///
-/// This is currently a placeholder implementation that only logs the request and
-/// returns an [`AudioSplitError::Unimplemented`] error.
-pub fn split_audio(input: &Path, output_dir: &Path) -> Result<(), AudioSplitError> {
-    info!(
-        "requested split of '{}' into '{}'",
-        input.display(),
-        output_dir.display()
-    );
-
-    Err(AudioSplitError::Unimplemented)
 }
