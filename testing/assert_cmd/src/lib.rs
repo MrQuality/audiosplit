@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::io;
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Output};
 
 pub struct Command {
@@ -10,7 +11,8 @@ pub struct Command {
 impl Command {
     pub fn cargo_bin(name: &str) -> io::Result<Self> {
         let var = format!("CARGO_BIN_EXE_{}", name);
-        let bin = env::var_os(var)
+        let bin = env::var_os(&var)
+            .or_else(|| fallback_bin(name).map(|p| p.into_os_string()))
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "binary path not exported"))?;
         Ok(Self {
             inner: ProcessCommand::new(bin),
@@ -37,6 +39,26 @@ impl Command {
             .output()
             .expect("failed to execute command for assertion");
         Assert { output }
+    }
+}
+
+fn fallback_bin(name: &str) -> Option<PathBuf> {
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")?;
+    let mut path = PathBuf::from(manifest_dir);
+    path.pop();
+    path.push("target");
+    let profile = env::var_os("PROFILE").unwrap_or_else(|| "debug".into());
+    path.push(profile);
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut bin_path = path.join(name);
+    #[cfg(windows)]
+    {
+        bin_path.set_extension("exe");
+    }
+    if bin_path.exists() {
+        Some(bin_path)
+    } else {
+        None
     }
 }
 

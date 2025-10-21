@@ -1,16 +1,15 @@
-use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::fs::{self, File};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use symphonia::core::audio::Signal;
-use symphonia::core::codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::audio::{SampleBuffer, SignalSpec};
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{
-    FormatOptions, FormatReader, FormatWriter, FormatWriterOptions, Packet,
-};
+use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use symphonia::default::{get_codecs, get_formats, get_probe};
+use symphonia::default::{get_codecs, get_probe};
 use thiserror::Error;
 
 /// Maximum number of segments produced from a single input file.
@@ -54,6 +53,14 @@ pub enum AudioSplitError {
     /// Error produced when a file name cannot be derived from the input path.
     #[error("failed to derive a base name for the input file")]
     InvalidInputName,
+
+    /// Error returned when the channel configuration cannot be represented.
+    #[error("unsupported channel layout")]
+    UnsupportedChannelLayout,
+
+    /// Error returned when the output segment exceeds the WAV size limits.
+    #[error("segment is too large to be written as a WAV file")]
+    SegmentTooLarge,
 }
 
 /// Configuration for the audio splitting operation.
@@ -115,7 +122,7 @@ fn frames_to_milliseconds(frames: u64, sample_rate: u64) -> u64 {
         return 0;
     }
 
-    (frames.saturating_mul(1000) + sample_rate - 1) / sample_rate
+    frames.saturating_mul(1000).div_ceil(sample_rate)
 }
 
 fn ensure_segment_limit(duration_ms: u64, segment_length_ms: u64) -> Result<(), AudioSplitError> {
@@ -123,7 +130,7 @@ fn ensure_segment_limit(duration_ms: u64, segment_length_ms: u64) -> Result<(), 
         return Err(AudioSplitError::ZeroDuration);
     }
 
-    let total_segments = (duration_ms + segment_length_ms - 1) / segment_length_ms;
+    let total_segments = duration_ms.div_ceil(segment_length_ms);
 
     if total_segments > MAX_SEGMENTS {
         Err(AudioSplitError::SegmentLimitExceeded {
@@ -163,7 +170,9 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         .codec_params
         .sample_rate
         .ok_or(AudioSplitError::MissingSampleRate)? as u64;
-    let segment_length_frames = (sample_rate * config.segment_length_ms + 999) / 1000;
+    let segment_length_frames = sample_rate
+        .saturating_mul(config.segment_length_ms)
+        .div_ceil(1000);
     if segment_length_frames == 0 {
         return Err(AudioSplitError::ZeroDuration);
     }
@@ -175,7 +184,6 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
 
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
-    let mut packets = VecDeque::new();
     let mut frames_in_segment: u64 = 0;
     let mut segment_index: u64 = 0;
     let mut total_frames_processed: u64 = 0;
@@ -195,64 +203,85 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         .codec_params
         .n_frames
         .map(|total| {
-            let segments = (total + segment_length_frames - 1) / segment_length_frames;
+            let segments = total.div_ceil(segment_length_frames);
             num_width(segments)
         })
         .unwrap_or(1);
 
+    let mut sample_buffer: Option<SampleBuffer<i16>> = None;
+    let mut writer: Option<SegmentWriter> = None;
+
     while let Ok(packet) = reader.next_packet() {
-        let packet_ref = packet.clone();
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                frames_in_segment += decoded.frames() as u64;
-                total_frames_processed =
-                    total_frames_processed.saturating_add(decoded.frames() as u64);
-                packets.push_back(packet_ref);
+                let spec = *decoded.spec();
+                let total_frames = decoded.frames();
+                let capacity = decoded.capacity();
+
+                total_frames_processed = total_frames_processed.saturating_add(total_frames as u64);
+
+                let buffer = sample_buffer
+                    .get_or_insert_with(|| SampleBuffer::<i16>::new(capacity as u64, spec));
+                buffer.copy_interleaved_ref(decoded);
+
+                let channel_count = spec.channels.count();
+                if channel_count == 0 {
+                    continue;
+                }
+
+                let mut frame_offset: usize = 0;
+                let samples = buffer.samples();
+
+                while frame_offset < total_frames {
+                    if frames_in_segment >= segment_length_frames {
+                        finalize_writer(&mut writer)?;
+                        frames_in_segment = 0;
+                    }
+
+                    if writer.is_none() {
+                        if segment_index >= MAX_SEGMENTS {
+                            return Err(AudioSplitError::SegmentLimitExceeded {
+                                limit: MAX_SEGMENTS,
+                            });
+                        }
+                        segment_index += 1;
+                        pad_width = pad_width.max(num_width(segment_index));
+                        writer = Some(create_writer(
+                            &config,
+                            base_name,
+                            extension,
+                            pad_width,
+                            segment_index,
+                            &spec,
+                        )?);
+                    }
+
+                    let remaining_in_segment =
+                        segment_length_frames.saturating_sub(frames_in_segment);
+                    let frames_available = total_frames as u64 - frame_offset as u64;
+                    let frames_to_write = remaining_in_segment.min(frames_available);
+
+                    let start_sample = frame_offset * channel_count;
+                    let end_sample = start_sample + frames_to_write as usize * channel_count;
+                    if let Some(active) = writer.as_mut() {
+                        active.write_samples(&samples[start_sample..end_sample])?;
+                    }
+
+                    frame_offset += frames_to_write as usize;
+                    frames_in_segment += frames_to_write;
+
+                    if frames_in_segment >= segment_length_frames {
+                        finalize_writer(&mut writer)?;
+                        frames_in_segment = 0;
+                    }
+                }
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(err) => return Err(AudioSplitError::from(err)),
         }
-
-        if frames_in_segment >= segment_length_frames {
-            if segment_index >= MAX_SEGMENTS {
-                return Err(AudioSplitError::SegmentLimitExceeded {
-                    limit: MAX_SEGMENTS,
-                });
-            }
-            segment_index += 1;
-            pad_width = pad_width.max(num_width(segment_index));
-            write_segment(
-                &config,
-                base_name,
-                extension,
-                pad_width,
-                segment_index,
-                &track.codec_params,
-                &packets,
-            )?;
-            frames_in_segment = 0;
-            packets.clear();
-        }
     }
 
-    if !packets.is_empty() {
-        if segment_index >= MAX_SEGMENTS {
-            return Err(AudioSplitError::SegmentLimitExceeded {
-                limit: MAX_SEGMENTS,
-            });
-        }
-        segment_index += 1;
-        pad_width = pad_width.max(num_width(segment_index));
-        write_segment(
-            &config,
-            base_name,
-            extension,
-            pad_width,
-            segment_index,
-            &track.codec_params,
-            &packets,
-        )?;
-    }
+    finalize_writer(&mut writer)?;
 
     let duration_ms = frames_to_milliseconds(total_frames_processed, sample_rate);
     ensure_segment_limit(duration_ms, config.segment_length_ms)?;
@@ -273,21 +302,21 @@ fn num_width(mut value: u64) -> usize {
     width
 }
 
-fn write_segment(
+fn create_writer(
     config: &Config,
     base_name: &str,
     extension: &str,
     pad_width: usize,
     segment_index: u64,
-    params: &CodecParameters,
-    packets: &VecDeque<Packet>,
-) -> Result<(), AudioSplitError> {
+    signal_spec: &SignalSpec,
+) -> Result<SegmentWriter, AudioSplitError> {
     let file_name = format!(
         "{}_{}_{}.{extension}",
         base_name,
         config.postfix,
         format_args!("{segment_index:0pad_width$}")
     );
+
     let mut output_path = config.output_dir.clone();
     output_path.push(file_name);
 
@@ -295,23 +324,102 @@ fn write_segment(
         return Err(AudioSplitError::InvalidPath(output_path));
     }
 
-    let mut output = File::create(&output_path)?;
-    let mut writer = get_formats().get(probed_format_type(params))?.write(
-        &mut output,
-        params,
-        &FormatWriterOptions::default(),
-    )?;
+    let channels = u16::try_from(signal_spec.channels.count())
+        .map_err(|_| AudioSplitError::UnsupportedChannelLayout)?;
 
-    for packet in packets {
-        writer.write(packet)?;
+    SegmentWriter::create(output_path, signal_spec.rate, channels)
+}
+
+fn finalize_writer(writer: &mut Option<SegmentWriter>) -> Result<(), AudioSplitError> {
+    if let Some(active) = writer.take() {
+        active.finalize()?;
     }
-    writer.flush()?;
-
     Ok(())
 }
 
-fn probed_format_type(params: &CodecParameters) -> symphonia::core::formats::FormatId {
-    params.codec
+struct SegmentWriter {
+    file: File,
+    data_bytes: u64,
+}
+
+impl SegmentWriter {
+    fn create<P: AsRef<Path>>(
+        path: P,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Self, AudioSplitError> {
+        let mut file = File::create(path)?;
+        write_wav_header(&mut file, sample_rate, channels)?;
+        Ok(Self {
+            file,
+            data_bytes: 0,
+        })
+    }
+
+    fn write_samples(&mut self, samples: &[i16]) -> Result<(), AudioSplitError> {
+        for &sample in samples {
+            let bytes = sample.to_le_bytes();
+            self.file.write_all(&bytes)?;
+        }
+        self.data_bytes = self
+            .data_bytes
+            .checked_add((samples.len() as u64).saturating_mul(2))
+            .ok_or(AudioSplitError::SegmentTooLarge)?;
+        Ok(())
+    }
+
+    fn finalize(mut self) -> Result<(), AudioSplitError> {
+        if self.data_bytes > u32::MAX as u64 {
+            return Err(AudioSplitError::SegmentTooLarge);
+        }
+
+        let data_len = self.data_bytes as u32;
+        let chunk_size = 36u32
+            .checked_add(data_len)
+            .ok_or(AudioSplitError::SegmentTooLarge)?;
+
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&chunk_size.to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&data_len.to_le_bytes())?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+fn write_wav_header(
+    file: &mut File,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<(), AudioSplitError> {
+    if channels == 0 {
+        return Err(AudioSplitError::UnsupportedChannelLayout);
+    }
+
+    let bits_per_sample: u16 = 16;
+    let bytes_per_sample = bits_per_sample / 8;
+    let block_align = channels
+        .checked_mul(bytes_per_sample)
+        .ok_or(AudioSplitError::UnsupportedChannelLayout)?;
+    let byte_rate = sample_rate
+        .checked_mul(block_align as u32)
+        .ok_or(AudioSplitError::UnsupportedChannelLayout)?;
+
+    file.write_all(b"RIFF")?;
+    file.write_all(&0u32.to_le_bytes())?; // Placeholder for chunk size
+    file.write_all(b"WAVE")?;
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?; // PCM header size
+    file.write_all(&1u16.to_le_bytes())?; // PCM format
+    file.write_all(&channels.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&0u32.to_le_bytes())?; // Placeholder for data length
+
+    Ok(())
 }
 
 #[cfg(test)]
