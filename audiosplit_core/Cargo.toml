@@ -6,8 +6,8 @@ authors = ["AudioSplit Contributors"]
 license = "MIT"
 
 [dependencies]
-symphonia = { version = "0.5" }
-thiserror = "1"
+symphonia = { workspace = true }
+thiserror = { workspace = true }
 log = "0.4"
 
 [dev-dependencies]
