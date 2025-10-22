@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 use tempfile::tempdir;
 
 /// Generate lightweight audio fixtures for the tests at runtime.
@@ -52,7 +53,12 @@ fn run_splits_audio_and_keeps_remainder_segment() -> Result<(), Box<dyn Error>> 
     write_test_tone(&input_path, 8_000, 1_100)?;
 
     let output_dir = tempdir()?;
-    let config = Config::new(&input_path, output_dir.path(), 400, "chunk")?;
+    let config = Config::new(
+        &input_path,
+        output_dir.path(),
+        Duration::from_millis(400),
+        "chunk",
+    )?;
     run(config)?;
 
     let mut outputs: Vec<_> = fs::read_dir(output_dir.path())?
@@ -88,7 +94,12 @@ fn run_enforces_segment_limit() -> Result<(), Box<dyn Error>> {
     write_test_tone(&input_path, 8_000, 50_001)?;
 
     let output_dir = tempdir()?;
-    let config = Config::new(&input_path, output_dir.path(), 1, "part")?;
+    let config = Config::new(
+        &input_path,
+        output_dir.path(),
+        Duration::from_millis(1),
+        "part",
+    )?;
     let err = run(config).expect_err("segment limit should be exceeded");
 
     match err {
