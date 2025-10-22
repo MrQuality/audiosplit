@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{builder::ValueParser, value_parser, Arg, Command};
+use clap::{builder::ValueParser, value_parser, Arg, ArgAction, Command};
 
 pub const DEFAULT_POSTFIX: &str = "part";
 
@@ -99,7 +99,7 @@ pub fn build_cli() -> Command {
                 .long("output")
                 .value_name("OUTPUT_DIR")
                 .help("Directory where the split tracks will be written")
-                .required(true)
+                .default_value(".")
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
@@ -109,6 +109,12 @@ pub fn build_cli() -> Command {
                 .value_name("POSTFIX")
                 .help("Postfix inserted into generated file names")
                 .default_value(DEFAULT_POSTFIX),
+        )
+        .arg(
+            Arg::new("overwrite")
+                .long("overwrite")
+                .help("Allow overwriting existing files in the output directory")
+                .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new("file_path")
