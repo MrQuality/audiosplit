@@ -492,7 +492,7 @@ enum ExecutionMode<'a> {
 
 fn split_internal<F>(
     config: &Config,
-    mode: ExecutionMode<'_>,
+    mut mode: ExecutionMode<'_>,
     mut progress: F,
 ) -> Result<(), AudioSplitError>
 where
@@ -610,7 +610,7 @@ where
                             segment_index,
                         )?;
                         let channels = segment_channels(&spec)?;
-                        match &mode {
+                        match &mut mode {
                             ExecutionMode::Execute => {
                                 writer =
                                     Some(SegmentWriter::create(output_path, spec.rate, channels)?);
