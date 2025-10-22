@@ -26,6 +26,17 @@ use thiserror::Error;
 const MAX_SEGMENTS: u64 = 50_000;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
+/// Events emitted during audio splitting progress.
+#[derive(Clone, Debug)]
+pub enum ProgressEvent {
+    /// Emitted when splitting begins. Contains the total duration when known.
+    Start { total_duration: Option<Duration> },
+    /// Emitted as additional audio is processed.
+    Advance { processed: Duration },
+    /// Emitted once the operation has completed.
+    Finish,
+}
+
 /// Errors that can occur while splitting audio files.
 ///
 /// # Examples
@@ -448,6 +459,45 @@ fn ensure_segment_limit(
 /// # }
 /// ```
 pub fn run(config: Config) -> Result<(), AudioSplitError> {
+    run_with_progress(config, |_| {})
+}
+
+/// Execute the audio splitting pipeline, providing progress updates through the supplied
+/// callback.
+pub fn run_with_progress<F>(config: Config, progress: F) -> Result<(), AudioSplitError>
+where
+    F: FnMut(ProgressEvent),
+{
+    split_internal(&config, ExecutionMode::Execute, progress)
+}
+
+/// Plan the output segments that would be generated for the provided configuration without
+/// writing any files to disk.
+pub fn plan_segments(config: &Config) -> Result<Vec<PathBuf>, AudioSplitError> {
+    let mut planned = Vec::new();
+    split_internal(
+        config,
+        ExecutionMode::DryRun {
+            planned: &mut planned,
+        },
+        |_| {},
+    )?;
+    Ok(planned)
+}
+
+enum ExecutionMode<'a> {
+    Execute,
+    DryRun { planned: &'a mut Vec<PathBuf> },
+}
+
+fn split_internal<F>(
+    config: &Config,
+    mode: ExecutionMode<'_>,
+    mut progress: F,
+) -> Result<(), AudioSplitError>
+where
+    F: FnMut(ProgressEvent),
+{
     let mut hint = Hint::new();
     if let Some(extension) = config.input_path.extension().and_then(|ext| ext.to_str()) {
         hint.with_extension(extension);
@@ -480,10 +530,15 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         return Err(AudioSplitError::ZeroDuration);
     }
 
-    if let Some(total_frames) = track.codec_params.n_frames {
+    let estimated_total = track.codec_params.n_frames;
+    if let Some(total_frames) = estimated_total {
         let duration = frames_to_duration(total_frames, sample_rate);
         ensure_segment_limit(duration, config.segment_length)?;
     }
+
+    progress(ProgressEvent::Start {
+        total_duration: estimated_total.map(|frames| frames_to_duration(frames, sample_rate)),
+    });
 
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
@@ -521,8 +576,6 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
                 let total_frames = decoded.frames();
                 let capacity = decoded.capacity();
 
-                total_frames_processed = total_frames_processed.saturating_add(total_frames as u64);
-
                 let buffer = sample_buffer
                     .get_or_insert_with(|| SampleBuffer::<i16>::new(capacity as u64, spec));
                 buffer.copy_interleaved_ref(decoded);
@@ -549,14 +602,23 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
                         }
                         segment_index += 1;
                         pad_width = pad_width.max(num_width(segment_index));
-                        writer = Some(create_writer(
-                            &config,
+                        let output_path = segment_output_path(
+                            config,
                             base_name,
                             extension,
                             pad_width,
                             segment_index,
-                            &spec,
-                        )?);
+                        )?;
+                        let channels = segment_channels(&spec)?;
+                        match &mode {
+                            ExecutionMode::Execute => {
+                                writer =
+                                    Some(SegmentWriter::create(output_path, spec.rate, channels)?);
+                            }
+                            ExecutionMode::DryRun { planned } => {
+                                planned.push(output_path);
+                            }
+                        }
                     }
 
                     let remaining_in_segment =
@@ -572,6 +634,10 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
 
                     frame_offset += frames_to_write as usize;
                     frames_in_segment += frames_to_write;
+                    total_frames_processed = total_frames_processed.saturating_add(frames_to_write);
+                    progress(ProgressEvent::Advance {
+                        processed: frames_to_duration(total_frames_processed, sample_rate),
+                    });
 
                     if frames_in_segment >= segment_length_frames {
                         finalize_writer(&mut writer)?;
@@ -589,6 +655,8 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
     let duration = frames_to_duration(total_frames_processed, sample_rate);
     ensure_segment_limit(duration, config.segment_length)?;
 
+    progress(ProgressEvent::Finish);
+
     Ok(())
 }
 
@@ -605,14 +673,13 @@ fn num_width(mut value: u64) -> usize {
     width
 }
 
-fn create_writer(
+fn segment_output_path(
     config: &Config,
     base_name: &str,
     extension: &str,
     pad_width: usize,
     segment_index: u64,
-    signal_spec: &SignalSpec,
-) -> Result<SegmentWriter, AudioSplitError> {
+) -> Result<PathBuf, AudioSplitError> {
     let file_name = format!(
         "{}_{}_{}.{extension}",
         base_name,
@@ -629,10 +696,12 @@ fn create_writer(
 
     ensure_can_write_file(&output_path, config.allow_overwrite)?;
 
-    let channels = u16::try_from(signal_spec.channels.count())
-        .map_err(|_| AudioSplitError::UnsupportedChannelLayout)?;
+    Ok(output_path)
+}
 
-    SegmentWriter::create(output_path, signal_spec.rate, channels)
+fn segment_channels(signal_spec: &SignalSpec) -> Result<u16, AudioSplitError> {
+    u16::try_from(signal_spec.channels.count())
+        .map_err(|_| AudioSplitError::UnsupportedChannelLayout)
 }
 
 fn finalize_writer(writer: &mut Option<SegmentWriter>) -> Result<(), AudioSplitError> {

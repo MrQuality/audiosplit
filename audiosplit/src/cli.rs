@@ -117,6 +117,12 @@ pub fn build_cli() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .help("Preview the generated segments without writing files")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("file_path")
                 .value_name("FILE_PATH")
                 .help("Path to the input audio file")

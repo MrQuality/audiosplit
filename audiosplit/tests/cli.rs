@@ -1,3 +1,4 @@
+use assert_cmd::prelude::*;
 use assert_cmd::Command;
 use std::error::Error;
 use std::fs::{self, File};
@@ -97,5 +98,48 @@ fn cli_reports_missing_input_file() -> Result<(), Box<dyn Error>> {
         .stderr_contains("input file does not exist");
 
     output_dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn cli_dry_run_prints_plan_without_creating_files() -> Result<(), Box<dyn Error>> {
+    let input_dir = tempdir()?;
+    let input_path = input_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 1_100)?;
+
+    let output_dir = tempdir()?;
+    let output_arg = output_dir.path().to_string_lossy().to_string();
+    let input_arg = input_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("audiosplit")?;
+    let assert = cmd
+        .args(["--length", "400ms", "--output"])
+        .arg(&output_arg)
+        .arg("--dry-run")
+        .arg(&input_arg)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone())?;
+    let expected_paths = [
+        output_dir.path().join("input_part_1.wav"),
+        output_dir.path().join("input_part_2.wav"),
+        output_dir.path().join("input_part_3.wav"),
+    ];
+
+    assert!(stdout.contains("Dry run: would generate 3 segment(s):"));
+    for path in expected_paths {
+        let needle = format!("  {}", path.display());
+        assert!(
+            stdout.contains(&needle),
+            "missing dry-run entry for {needle}"
+        );
+    }
+
+    let mut produced = std::fs::read_dir(output_dir.path())?;
+    assert!(produced.next().is_none(), "dry run should not create files");
+
+    output_dir.close()?;
+    input_dir.close()?;
     Ok(())
 }
