@@ -11,6 +11,7 @@ use std::convert::TryFrom;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -23,6 +24,7 @@ use thiserror::Error;
 
 /// Maximum number of segments produced from a single input file.
 const MAX_SEGMENTS: u64 = 50_000;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// Errors that can occur while splitting audio files.
 ///
@@ -30,6 +32,7 @@ const MAX_SEGMENTS: u64 = 50_000;
 ///
 /// ```
 /// use audiosplit_core::{AudioSplitError, Config};
+/// use std::time::Duration;
 /// use tempfile::tempdir;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +40,7 @@ const MAX_SEGMENTS: u64 = 50_000;
 /// let missing_input = temp.path().join("missing.wav");
 /// let output_dir = temp.path().join("segments");
 ///
-/// match Config::new(&missing_input, &output_dir, 1_000, "part") {
+/// match Config::new(&missing_input, &output_dir, Duration::from_secs(1), "part") {
 ///     Err(AudioSplitError::InvalidPath(path)) => assert_eq!(path, missing_input),
 ///     other => panic!("unexpected result: {other:?}"),
 /// }
@@ -59,8 +62,12 @@ pub enum AudioSplitError {
     InvalidPath(PathBuf),
 
     /// Error returned when the requested segment duration is zero.
-    #[error("segment length must be greater than zero milliseconds")]
+    #[error("segment length must be greater than zero")]
     ZeroDuration,
+
+    /// Error returned when the requested segment duration is larger than supported.
+    #[error("segment length is too large")]
+    DurationTooLarge,
 
     /// Error returned when the number of generated segments exceeds the supported limit.
     #[error("segment limit of {limit} exceeded")]
@@ -100,8 +107,9 @@ pub enum AudioSplitError {
 ///
 /// ```
 /// use audiosplit_core::Config;
-/// use tempfile::tempdir;
 /// use std::fs::File;
+/// use std::time::Duration;
+/// use tempfile::tempdir;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let temp = tempdir()?;
@@ -109,8 +117,8 @@ pub enum AudioSplitError {
 /// File::create(&input)?;
 /// let output_dir = temp.path().join("segments");
 ///
-/// let config = Config::new(&input, &output_dir, 1_000, "part")?;
-/// assert_eq!(config.segment_length_ms, 1_000);
+/// let config = Config::new(&input, &output_dir, Duration::from_secs(1), "part")?;
+/// assert_eq!(config.segment_length, Duration::from_secs(1));
 /// assert_eq!(config.postfix, "part");
 /// # Ok(())
 /// # }
@@ -121,8 +129,8 @@ pub struct Config {
     pub input_path: PathBuf,
     /// Canonicalized directory into which the output files will be written.
     pub output_dir: PathBuf,
-    /// Desired length of each segment in milliseconds.
-    pub segment_length_ms: u64,
+    /// Desired length of each segment.
+    pub segment_length: Duration,
     /// Postfix inserted into the output file names.
     pub postfix: String,
 }
@@ -133,14 +141,14 @@ impl Config {
     /// # Parameters
     /// - `input`: Path to the source media file.
     /// - `output`: Directory where the split segments will be written.
-    /// - `segment_length_ms`: Desired length of each segment in milliseconds.
+    /// - `segment_length`: Desired length of each segment.
     /// - `postfix`: Postfix inserted into the generated filenames.
     ///
     /// # Returns
     /// A canonicalized [`Config`] ready for use with [`run`].
     ///
     /// # Errors
-    /// Returns [`AudioSplitError::ZeroDuration`] when `segment_length_ms` is zero.
+    /// Returns [`AudioSplitError::ZeroDuration`] when `segment_length` is zero.
     /// Returns [`AudioSplitError::InvalidPath`] when `input` is not a readable
     /// file or `output` cannot be created as a directory.
     ///
@@ -148,8 +156,9 @@ impl Config {
     ///
     /// ```
     /// use audiosplit_core::Config;
-    /// use tempfile::tempdir;
     /// use std::fs::File;
+    /// use std::time::Duration;
+    /// use tempfile::tempdir;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let temp = tempdir()?;
@@ -157,7 +166,7 @@ impl Config {
     /// File::create(&input_path)?;
     /// let output_dir = temp.path().join("segments");
     ///
-    /// let config = Config::new(&input_path, &output_dir, 500, "demo")?;
+    /// let config = Config::new(&input_path, &output_dir, Duration::from_millis(500), "demo")?;
     /// assert_eq!(config.postfix, "demo");
     /// # Ok(())
     /// # }
@@ -165,10 +174,10 @@ impl Config {
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>, S: Into<String>>(
         input: P,
         output: Q,
-        segment_length_ms: u64,
+        segment_length: Duration,
         postfix: S,
     ) -> Result<Self, AudioSplitError> {
-        if segment_length_ms == 0 {
+        if segment_length.is_zero() {
             return Err(AudioSplitError::ZeroDuration);
         }
 
@@ -195,28 +204,81 @@ impl Config {
         Ok(Self {
             input_path,
             output_dir,
-            segment_length_ms,
+            segment_length,
             postfix: postfix.into(),
         })
     }
 }
 
-fn frames_to_milliseconds(frames: u64, sample_rate: u64) -> u64 {
+fn frames_to_duration(frames: u64, sample_rate: u64) -> Duration {
     if sample_rate == 0 {
-        return 0;
+        return Duration::ZERO;
     }
 
-    frames.saturating_mul(1000).div_ceil(sample_rate)
+    let rate = u128::from(sample_rate);
+    let frames_ns = u128::from(frames).saturating_mul(NANOS_PER_SECOND);
+    let total_ns = frames_ns.div_ceil(rate);
+
+    let secs = total_ns / NANOS_PER_SECOND;
+    let nanos = (total_ns % NANOS_PER_SECOND) as u32;
+
+    if secs > u128::from(u64::MAX) {
+        Duration::MAX
+    } else {
+        Duration::new(secs as u64, nanos)
+    }
 }
 
-fn ensure_segment_limit(duration_ms: u64, segment_length_ms: u64) -> Result<(), AudioSplitError> {
-    if segment_length_ms == 0 {
+fn duration_to_frames(duration: Duration, sample_rate: u64) -> Result<u64, AudioSplitError> {
+    if sample_rate == 0 {
+        return Ok(0);
+    }
+
+    let rate = u128::from(sample_rate);
+    let secs_frames = rate
+        .checked_mul(u128::from(duration.as_secs()))
+        .ok_or(AudioSplitError::DurationTooLarge)?;
+
+    let nanos = u128::from(duration.subsec_nanos());
+    let nanos_frames = if nanos == 0 {
+        0
+    } else {
+        let scaled = rate
+            .checked_mul(nanos)
+            .ok_or(AudioSplitError::DurationTooLarge)?;
+        scaled
+            .checked_add(NANOS_PER_SECOND - 1)
+            .ok_or(AudioSplitError::DurationTooLarge)?
+            / NANOS_PER_SECOND
+    };
+
+    let total_frames = secs_frames
+        .checked_add(nanos_frames)
+        .ok_or(AudioSplitError::DurationTooLarge)?;
+
+    u64::try_from(total_frames).map_err(|_| AudioSplitError::DurationTooLarge)
+}
+
+fn ensure_segment_limit(
+    duration: Duration,
+    segment_length: Duration,
+) -> Result<(), AudioSplitError> {
+    if segment_length.is_zero() {
         return Err(AudioSplitError::ZeroDuration);
     }
 
-    let total_segments = duration_ms.div_ceil(segment_length_ms);
+    let segment_ns = segment_length.as_nanos();
+    if segment_ns == 0 {
+        return Err(AudioSplitError::ZeroDuration);
+    }
 
-    if total_segments > MAX_SEGMENTS {
+    let total_ns = duration.as_nanos();
+    let adjusted = total_ns
+        .checked_add(segment_ns - 1)
+        .ok_or(AudioSplitError::DurationTooLarge)?;
+    let total_segments = adjusted / segment_ns;
+
+    if total_segments > u128::from(MAX_SEGMENTS) {
         Err(AudioSplitError::SegmentLimitExceeded {
             limit: MAX_SEGMENTS,
         })
@@ -241,10 +303,11 @@ fn ensure_segment_limit(duration_ms: u64, segment_length_ms: u64) -> Result<(), 
 ///
 /// ```
 /// use audiosplit_core::{run, Config};
-/// use tempfile::tempdir;
 /// use std::fs::{self, File};
 /// use std::io::{Seek, Write};
 /// use std::path::Path;
+/// use std::time::Duration;
+/// use tempfile::tempdir;
 ///
 /// fn write_sine_wav(path: &Path) -> std::io::Result<()> {
 ///     let sample_rate = 8_000u32;
@@ -291,7 +354,7 @@ fn ensure_segment_limit(duration_ms: u64, segment_length_ms: u64) -> Result<(), 
 /// write_sine_wav(&input_path)?;
 /// let output_dir = temp.path().join("segments");
 ///
-/// let config = Config::new(&input_path, &output_dir, 250, "part")?;
+/// let config = Config::new(&input_path, &output_dir, Duration::from_millis(250), "part")?;
 /// run(config)?;
 ///
 /// let mut produced: Vec<_> = fs::read_dir(&output_dir)?
@@ -331,16 +394,14 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         .codec_params
         .sample_rate
         .ok_or(AudioSplitError::MissingSampleRate)? as u64;
-    let segment_length_frames = sample_rate
-        .saturating_mul(config.segment_length_ms)
-        .div_ceil(1000);
+    let segment_length_frames = duration_to_frames(config.segment_length, sample_rate)?;
     if segment_length_frames == 0 {
         return Err(AudioSplitError::ZeroDuration);
     }
 
     if let Some(total_frames) = track.codec_params.n_frames {
-        let duration_ms = frames_to_milliseconds(total_frames, sample_rate);
-        ensure_segment_limit(duration_ms, config.segment_length_ms)?;
+        let duration = frames_to_duration(total_frames, sample_rate);
+        ensure_segment_limit(duration, config.segment_length)?;
     }
 
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
@@ -444,8 +505,8 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
 
     finalize_writer(&mut writer)?;
 
-    let duration_ms = frames_to_milliseconds(total_frames_processed, sample_rate);
-    ensure_segment_limit(duration_ms, config.segment_length_ms)?;
+    let duration = frames_to_duration(total_frames_processed, sample_rate);
+    ensure_segment_limit(duration, config.segment_length)?;
 
     Ok(())
 }
@@ -590,30 +651,36 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn frames_to_milliseconds_rounds_up_partial_frame() {
-        assert_eq!(frames_to_milliseconds(48_001, 48_000), 1_001);
+    fn frames_to_duration_rounds_up_partial_frame() {
+        assert_eq!(
+            frames_to_duration(48_001, 48_000),
+            Duration::from_nanos(1_000_020_834)
+        );
     }
 
     #[test]
-    fn frames_to_milliseconds_returns_zero_for_zero_rate() {
-        assert_eq!(frames_to_milliseconds(1_000, 0), 0);
+    fn frames_to_duration_returns_zero_for_zero_rate() {
+        assert_eq!(frames_to_duration(1_000, 0), Duration::ZERO);
     }
 
     #[test]
     fn ensure_segment_limit_allows_exact_fit() {
-        let segment_length_ms = 1_000;
-        let duration_ms = MAX_SEGMENTS.saturating_mul(segment_length_ms);
+        let segment_length = Duration::from_secs(1);
+        let duration = Duration::from_secs(MAX_SEGMENTS);
 
-        ensure_segment_limit(duration_ms, segment_length_ms)
+        ensure_segment_limit(duration, segment_length)
             .expect("duration exactly divisible by segment length should pass");
     }
 
     #[test]
     fn ensure_segment_limit_counts_partial_segment() {
-        let segment_length_ms = 1_000;
-        let duration_ms = segment_length_ms * 2 + 1;
+        let segment_length = Duration::from_millis(1_000);
+        let duration = segment_length
+            .checked_mul(2)
+            .and_then(|d| d.checked_add(Duration::from_millis(1)))
+            .expect("duration fits in u128");
 
-        ensure_segment_limit(duration_ms, segment_length_ms)
+        ensure_segment_limit(duration, segment_length)
             .expect("partial segments should still be within the limit");
     }
 
@@ -631,7 +698,7 @@ mod tests {
         let input_path = temp_dir.path().join("input.wav");
         File::create(&input_path).expect("create input file");
 
-        let err = Config::new(&input_path, temp_dir.path(), 0, "part")
+        let err = Config::new(&input_path, temp_dir.path(), Duration::ZERO, "part")
             .expect_err("expected zero duration rejection");
 
         assert!(matches!(err, AudioSplitError::ZeroDuration));
@@ -642,8 +709,13 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
         let missing_input = temp_dir.path().join("missing.wav");
 
-        let err = Config::new(&missing_input, temp_dir.path(), 1_000, "part")
-            .expect_err("expected invalid input path error");
+        let err = Config::new(
+            &missing_input,
+            temp_dir.path(),
+            Duration::from_secs(1),
+            "part",
+        )
+        .expect_err("expected invalid input path error");
 
         match err {
             AudioSplitError::InvalidPath(path) => assert_eq!(path, missing_input),
@@ -660,7 +732,7 @@ mod tests {
         let output_file = temp_dir.path().join("output_file");
         File::create(&output_file).expect("create output file");
 
-        let err = Config::new(&input_path, &output_file, 1_000, "part")
+        let err = Config::new(&input_path, &output_file, Duration::from_secs(1), "part")
             .expect_err("expected invalid output directory error");
 
         match err {
@@ -679,23 +751,23 @@ mod tests {
 
         let output_dir = nested_dir.join("output");
 
-        let config = Config::new(&input_path, &output_dir, 500, "demo")
+        let config = Config::new(&input_path, &output_dir, Duration::from_millis(500), "demo")
             .expect("config should be constructed");
 
         assert!(config.input_path.is_absolute());
         assert!(config.output_dir.is_absolute());
-        assert_eq!(config.segment_length_ms, 500);
+        assert_eq!(config.segment_length, Duration::from_millis(500));
         assert_eq!(config.postfix, "demo");
     }
 
     #[test]
     fn segment_limit_rejection_from_duration() {
-        let segment_length_ms = 1_000;
-        let duration_ms = MAX_SEGMENTS
-            .saturating_mul(segment_length_ms)
-            .saturating_add(1);
+        let segment_length = Duration::from_secs(1);
+        let duration = Duration::from_secs(MAX_SEGMENTS)
+            .checked_add(Duration::from_secs(1))
+            .expect("duration fits within bounds");
 
-        let err = ensure_segment_limit(duration_ms, segment_length_ms)
+        let err = ensure_segment_limit(duration, segment_length)
             .expect_err("expected segment limit rejection");
 
         match err {

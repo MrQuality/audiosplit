@@ -56,7 +56,7 @@ fn cli_splits_audio_into_segments_with_remainder() -> Result<(), Box<dyn Error>>
     let input_arg = input_path.to_string_lossy().to_string();
 
     let mut cmd = Command::cargo_bin("audiosplit")?;
-    cmd.args(["--length", "400", "--output"])
+    cmd.args(["--length", "400ms", "--output"])
         .arg(&output_arg)
         .arg(&input_arg);
     cmd.assert().success();
@@ -89,7 +89,7 @@ fn cli_reports_missing_input_file() -> Result<(), Box<dyn Error>> {
     let output_arg = output_dir.path().to_string_lossy().to_string();
 
     let mut cmd = Command::cargo_bin("audiosplit")?;
-    cmd.args(["--length", "400", "--output"])
+    cmd.args(["--length", "400ms", "--output"])
         .arg(&output_arg)
         .arg("missing.wav");
     cmd.assert()
