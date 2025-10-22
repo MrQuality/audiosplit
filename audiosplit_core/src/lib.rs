@@ -568,6 +568,7 @@ where
 
     let mut sample_buffer: Option<SampleBuffer<i16>> = None;
     let mut writer: Option<SegmentWriter> = None;
+    let mut segment_open = false;
 
     while let Ok(packet) = reader.next_packet() {
         match decoder.decode(&packet) {
@@ -589,12 +590,13 @@ where
                 let samples = buffer.samples();
 
                 while frame_offset < total_frames {
-                    if frames_in_segment >= segment_length_frames {
-                        finalize_writer(&mut writer)?;
+                    if segment_open && frames_in_segment >= segment_length_frames {
+                        finalize_segment(&mut mode, &mut writer)?;
                         frames_in_segment = 0;
+                        segment_open = false;
                     }
 
-                    if writer.is_none() {
+                    if !segment_open {
                         if segment_index >= MAX_SEGMENTS {
                             return Err(AudioSplitError::SegmentLimitExceeded {
                                 limit: MAX_SEGMENTS,
@@ -609,9 +611,9 @@ where
                             pad_width,
                             segment_index,
                         )?;
-                        let channels = segment_channels(&spec)?;
                         match &mut mode {
                             ExecutionMode::Execute => {
+                                let channels = segment_channels(&spec)?;
                                 writer =
                                     Some(SegmentWriter::create(output_path, spec.rate, channels)?);
                             }
@@ -619,6 +621,7 @@ where
                                 planned.push(output_path);
                             }
                         }
+                        segment_open = true;
                     }
 
                     let remaining_in_segment =
@@ -639,9 +642,10 @@ where
                         processed: frames_to_duration(total_frames_processed, sample_rate),
                     });
 
-                    if frames_in_segment >= segment_length_frames {
-                        finalize_writer(&mut writer)?;
+                    if segment_open && frames_in_segment >= segment_length_frames {
+                        finalize_segment(&mut mode, &mut writer)?;
                         frames_in_segment = 0;
+                        segment_open = false;
                     }
                 }
             }
@@ -650,7 +654,9 @@ where
         }
     }
 
-    finalize_writer(&mut writer)?;
+    if segment_open {
+        finalize_segment(&mut mode, &mut writer)?;
+    }
 
     let duration = frames_to_duration(total_frames_processed, sample_rate);
     ensure_segment_limit(duration, config.segment_length)?;
@@ -709,6 +715,19 @@ fn finalize_writer(writer: &mut Option<SegmentWriter>) -> Result<(), AudioSplitE
         active.finalize()?;
     }
     Ok(())
+}
+
+fn finalize_segment(
+    mode: &mut ExecutionMode<'_>,
+    writer: &mut Option<SegmentWriter>,
+) -> Result<(), AudioSplitError> {
+    match mode {
+        ExecutionMode::Execute => finalize_writer(writer),
+        ExecutionMode::DryRun { .. } => {
+            *writer = None;
+            Ok(())
+        }
+    }
 }
 
 struct SegmentWriter {

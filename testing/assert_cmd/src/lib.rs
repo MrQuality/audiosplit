@@ -4,6 +4,10 @@ use std::io;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Output};
 
+pub mod prelude {
+    pub use crate::Command;
+}
+
 pub struct Command {
     inner: ProcessCommand,
 }
@@ -92,5 +96,9 @@ impl Assert {
             "stderr did not contain '{needle}'.\nActual stderr: {stderr}"
         );
         self
+    }
+
+    pub fn get_output(&self) -> &Output {
+        &self.output
     }
 }
