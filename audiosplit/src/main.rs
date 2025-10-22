@@ -28,14 +28,17 @@ fn main() -> anyhow::Result<()> {
         .expect("required argument");
     let output_dir = matches
         .get_one::<PathBuf>("output")
-        .expect("required argument");
+        .expect("defaulted argument");
     let postfix = matches
         .get_one::<String>("postfix")
         .cloned()
         .unwrap_or_else(|| DEFAULT_POSTFIX.to_owned());
+    let overwrite = matches.get_flag("overwrite");
 
-    let config =
-        Config::new(input_path, output_dir, segment_length, postfix).with_context(|| {
+    let config = Config::builder(input_path, output_dir, segment_length, postfix)
+        .overwrite(overwrite)
+        .build()
+        .with_context(|| {
             format!(
                 "failed to create configuration for '{}'",
                 input_path.display()

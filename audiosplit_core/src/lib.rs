@@ -61,6 +61,10 @@ pub enum AudioSplitError {
     #[error("invalid path: {0}")]
     InvalidPath(PathBuf),
 
+    /// Error returned when a generated segment would overwrite an existing file.
+    #[error("output file already exists: {0}")]
+    OutputExists(PathBuf),
+
     /// Error returned when the requested segment duration is zero.
     #[error("segment length must be greater than zero")]
     ZeroDuration,
@@ -133,6 +137,8 @@ pub struct Config {
     pub segment_length: Duration,
     /// Postfix inserted into the output file names.
     pub postfix: String,
+    /// Whether existing output files may be overwritten.
+    pub allow_overwrite: bool,
 }
 
 impl Config {
@@ -177,37 +183,112 @@ impl Config {
         segment_length: Duration,
         postfix: S,
     ) -> Result<Self, AudioSplitError> {
-        if segment_length.is_zero() {
-            return Err(AudioSplitError::ZeroDuration);
-        }
+        ConfigBuilder::new(input, output, segment_length, postfix).build()
+    }
 
-        let input_ref = input.as_ref();
-        let output_ref = output.as_ref();
+    /// Create a [`ConfigBuilder`] pre-populated with the provided values.
+    pub fn builder<P: AsRef<Path>, Q: AsRef<Path>, S: Into<String>>(
+        input: P,
+        output: Q,
+        segment_length: Duration,
+        postfix: S,
+    ) -> ConfigBuilder {
+        ConfigBuilder::new(input, output, segment_length, postfix)
+    }
+}
 
-        let input_path = fs::canonicalize(input_ref)
-            .map_err(|_| AudioSplitError::InvalidPath(input_ref.to_path_buf()))?;
+/// Builder for constructing [`Config`] instances with additional options.
+pub struct ConfigBuilder {
+    input: PathBuf,
+    output: PathBuf,
+    segment_length: Duration,
+    postfix: String,
+    overwrite: bool,
+}
 
-        fs::create_dir_all(output_ref)
-            .map_err(|_| AudioSplitError::InvalidPath(output_ref.to_path_buf()))?;
-
-        let output_dir = fs::canonicalize(output_ref)
-            .map_err(|_| AudioSplitError::InvalidPath(output_ref.to_path_buf()))?;
-
-        if !input_path.is_file() {
-            return Err(AudioSplitError::InvalidPath(input_path));
-        }
-
-        if !output_dir.is_dir() {
-            return Err(AudioSplitError::InvalidPath(output_dir));
-        }
-
-        Ok(Self {
-            input_path,
-            output_dir,
+impl ConfigBuilder {
+    /// Create a builder using the supplied configuration inputs.
+    pub fn new<P: AsRef<Path>, Q: AsRef<Path>, S: Into<String>>(
+        input: P,
+        output: Q,
+        segment_length: Duration,
+        postfix: S,
+    ) -> Self {
+        Self {
+            input: input.as_ref().to_path_buf(),
+            output: output.as_ref().to_path_buf(),
             segment_length,
             postfix: postfix.into(),
+            overwrite: false,
+        }
+    }
+
+    /// Allow or forbid overwriting existing segment files.
+    pub fn overwrite(mut self, allow: bool) -> Self {
+        self.overwrite = allow;
+        self
+    }
+
+    /// Finalize the builder, validating paths and constructing the [`Config`].
+    pub fn build(self) -> Result<Config, AudioSplitError> {
+        validate_segment_length(self.segment_length)?;
+        let input_path = canonicalize_existing_file(&self.input)?;
+        let output_dir = ensure_output_directory(&self.output)?;
+
+        Ok(Config {
+            input_path,
+            output_dir,
+            segment_length: self.segment_length,
+            postfix: self.postfix,
+            allow_overwrite: self.overwrite,
         })
     }
+}
+
+fn validate_segment_length(segment_length: Duration) -> Result<(), AudioSplitError> {
+    if segment_length.is_zero() {
+        Err(AudioSplitError::ZeroDuration)
+    } else {
+        Ok(())
+    }
+}
+
+fn canonicalize_existing_file(path: &Path) -> Result<PathBuf, AudioSplitError> {
+    let canonical =
+        fs::canonicalize(path).map_err(|_| AudioSplitError::InvalidPath(path.to_path_buf()))?;
+
+    if canonical.is_file() {
+        Ok(canonical)
+    } else {
+        Err(AudioSplitError::InvalidPath(canonical))
+    }
+}
+
+fn ensure_output_directory(path: &Path) -> Result<PathBuf, AudioSplitError> {
+    if path.exists() {
+        if !path.is_dir() {
+            return Err(AudioSplitError::InvalidPath(path.to_path_buf()));
+        }
+    } else {
+        fs::create_dir_all(path)?;
+    }
+
+    let canonical =
+        fs::canonicalize(path).map_err(|_| AudioSplitError::InvalidPath(path.to_path_buf()))?;
+
+    if canonical.is_dir() {
+        Ok(canonical)
+    } else {
+        Err(AudioSplitError::InvalidPath(canonical))
+    }
+}
+
+fn ensure_can_write_file(path: &Path, allow_overwrite: bool) -> Result<(), AudioSplitError> {
+    if !allow_overwrite && path.exists() {
+        return Err(AudioSplitError::OutputExists(path.to_path_buf()));
+    }
+
+    Ok(())
 }
 
 fn frames_to_duration(frames: u64, sample_rate: u64) -> Duration {
@@ -546,6 +627,8 @@ fn create_writer(
         return Err(AudioSplitError::InvalidPath(output_path));
     }
 
+    ensure_can_write_file(&output_path, config.allow_overwrite)?;
+
     let channels = u16::try_from(signal_spec.channels.count())
         .map_err(|_| AudioSplitError::UnsupportedChannelLayout)?;
 
@@ -758,6 +841,72 @@ mod tests {
         assert!(config.output_dir.is_absolute());
         assert_eq!(config.segment_length, Duration::from_millis(500));
         assert_eq!(config.postfix, "demo");
+    }
+
+    #[test]
+    fn config_builder_defaults_to_no_overwrite() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+        let output_dir = temp_dir.path().join("output");
+
+        let config = Config::builder(&input_path, &output_dir, Duration::from_secs(1), "part")
+            .build()
+            .expect("config should build");
+
+        assert!(!config.allow_overwrite);
+    }
+
+    #[test]
+    fn ensure_output_directory_creates_and_canonicalizes() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let nested_output = temp_dir.path().join("nested/output");
+
+        let canonical =
+            ensure_output_directory(&nested_output).expect("directory should be created");
+
+        assert!(canonical.is_dir());
+        assert!(canonical.is_absolute());
+    }
+
+    #[test]
+    fn ensure_output_directory_rejects_file_paths() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("not_a_dir");
+        File::create(&file_path).expect("create file");
+
+        let err =
+            ensure_output_directory(&file_path).expect_err("expected rejection for file path");
+
+        match err {
+            AudioSplitError::InvalidPath(path) => assert_eq!(path, file_path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_can_write_file_prevents_overwrite_when_disabled() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("segment.wav");
+        File::create(&file_path).expect("create file");
+
+        let err =
+            ensure_can_write_file(&file_path, false).expect_err("expected overwrite prevention");
+
+        match err {
+            AudioSplitError::OutputExists(path) => assert_eq!(path, file_path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_can_write_file_allows_overwrite_when_enabled() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("segment.wav");
+        File::create(&file_path).expect("create file");
+
+        ensure_can_write_file(&file_path, true)
+            .expect("overwrite flag should allow existing files");
     }
 
     #[test]
