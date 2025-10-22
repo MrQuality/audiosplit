@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
     let progress_handle = progress.clone();
     let result = run_with_progress(config, move |event| match event {
         ProgressEvent::Start { total_duration } => {
-            let mut state = state.borrow_mut();
+            let state = state.borrow_mut();
             if let Some(duration) = total_duration {
                 let total_millis = duration_to_millis(duration).max(1);
                 state.total_millis = Some(total_millis);
@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
         ProgressEvent::Advance { processed } => {
             let processed_millis = duration_to_millis(processed);
             let human = format!("{}", HumanDuration(processed));
-            let mut state = state.borrow_mut();
+            let state = state.borrow_mut();
             if let Some(total) = state.total_millis {
                 let clamped = processed_millis.min(total);
                 progress_handle.set_position(clamped);
