@@ -1,3 +1,12 @@
+//! Core logic for splitting audio files into evenly sized chunks.
+//!
+//! The crate exposes a [`Config`] type for describing how audio should be
+//! segmented and a [`run`] function that performs the actual split. Most
+//! applications will construct a configuration by canonicalizing the desired
+//! input file and destination directory, then invoke [`run`] to emit numbered
+//! audio segments. Errors are reported through [`AudioSplitError`], allowing
+//! callers to recover from issues such as unsupported codecs or invalid paths.
+
 use std::convert::TryFrom;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
@@ -16,6 +25,25 @@ use thiserror::Error;
 const MAX_SEGMENTS: u64 = 50_000;
 
 /// Errors that can occur while splitting audio files.
+///
+/// # Examples
+///
+/// ```
+/// use audiosplit_core::{AudioSplitError, Config};
+/// use tempfile::tempdir;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let temp = tempdir()?;
+/// let missing_input = temp.path().join("missing.wav");
+/// let output_dir = temp.path().join("segments");
+///
+/// match Config::new(&missing_input, &output_dir, 1_000, "part") {
+///     Err(AudioSplitError::InvalidPath(path)) => assert_eq!(path, missing_input),
+///     other => panic!("unexpected result: {other:?}"),
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Error)]
 pub enum AudioSplitError {
     /// Wrapper around errors produced by the Symphonia decoding library.
@@ -64,6 +92,29 @@ pub enum AudioSplitError {
 }
 
 /// Configuration for the audio splitting operation.
+///
+/// The configuration ensures paths are canonicalized prior to processing and
+/// stores the segment length and filename postfix used during splitting.
+///
+/// # Examples
+///
+/// ```
+/// use audiosplit_core::Config;
+/// use tempfile::tempdir;
+/// use std::fs::File;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let temp = tempdir()?;
+/// let input = temp.path().join("input.wav");
+/// File::create(&input)?;
+/// let output_dir = temp.path().join("segments");
+///
+/// let config = Config::new(&input, &output_dir, 1_000, "part")?;
+/// assert_eq!(config.segment_length_ms, 1_000);
+/// assert_eq!(config.postfix, "part");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Canonicalized path of the source file to split.
@@ -78,6 +129,39 @@ pub struct Config {
 
 impl Config {
     /// Construct a new [`Config`], canonicalizing the provided paths.
+    ///
+    /// # Parameters
+    /// - `input`: Path to the source media file.
+    /// - `output`: Directory where the split segments will be written.
+    /// - `segment_length_ms`: Desired length of each segment in milliseconds.
+    /// - `postfix`: Postfix inserted into the generated filenames.
+    ///
+    /// # Returns
+    /// A canonicalized [`Config`] ready for use with [`run`].
+    ///
+    /// # Errors
+    /// Returns [`AudioSplitError::ZeroDuration`] when `segment_length_ms` is zero.
+    /// Returns [`AudioSplitError::InvalidPath`] when `input` is not a readable
+    /// file or `output` cannot be created as a directory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use audiosplit_core::Config;
+    /// use tempfile::tempdir;
+    /// use std::fs::File;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let temp = tempdir()?;
+    /// let input_path = temp.path().join("input.wav");
+    /// File::create(&input_path)?;
+    /// let output_dir = temp.path().join("segments");
+    ///
+    /// let config = Config::new(&input_path, &output_dir, 500, "demo")?;
+    /// assert_eq!(config.postfix, "demo");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>, S: Into<String>>(
         input: P,
         output: Q,
@@ -142,6 +226,83 @@ fn ensure_segment_limit(duration_ms: u64, segment_length_ms: u64) -> Result<(), 
 }
 
 /// Perform the splitting operation using the supplied [`Config`].
+///
+/// # Parameters
+/// - `config`: The fully constructed [`Config`] controlling the split.
+///
+/// # Returns
+/// Returns `Ok(())` once all segments have been written to disk.
+///
+/// # Errors
+/// Propagates [`AudioSplitError`] variants for issues encountered during
+/// decoding, validation, or file I/O.
+///
+/// # Examples
+///
+/// ```
+/// use audiosplit_core::{run, Config};
+/// use tempfile::tempdir;
+/// use std::fs::{self, File};
+/// use std::io::{Seek, Write};
+/// use std::path::Path;
+///
+/// fn write_sine_wav(path: &Path) -> std::io::Result<()> {
+///     let sample_rate = 8_000u32;
+///     let channels = 1u16;
+///     let bits_per_sample = 16u16;
+///     let duration_ms = 1_000u32;
+///     let total_samples = (sample_rate as u64 * duration_ms as u64 / 1_000) as usize;
+///     let mut samples = Vec::with_capacity(total_samples);
+///     for n in 0..total_samples {
+///         let value = (n as f32 * 440.0 * std::f32::consts::TAU / sample_rate as f32).sin();
+///         samples.push((value * i16::MAX as f32 * 0.1) as i16);
+///     }
+///
+///     let mut file = File::create(path)?;
+///     let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+///     let block_align = channels * (bits_per_sample / 8);
+///     let data_len = (samples.len() * 2) as u32;
+///     let chunk_size = 36 + data_len;
+///
+///     file.write_all(b"RIFF")?;
+///     file.write_all(&chunk_size.to_le_bytes())?;
+///     file.write_all(b"WAVE")?;
+///     file.write_all(b"fmt ")?;
+///     file.write_all(&16u32.to_le_bytes())?;
+///     file.write_all(&1u16.to_le_bytes())?;
+///     file.write_all(&channels.to_le_bytes())?;
+///     file.write_all(&sample_rate.to_le_bytes())?;
+///     file.write_all(&byte_rate.to_le_bytes())?;
+///     file.write_all(&block_align.to_le_bytes())?;
+///     file.write_all(&bits_per_sample.to_le_bytes())?;
+///     file.write_all(b"data")?;
+///     file.write_all(&data_len.to_le_bytes())?;
+///     for sample in samples {
+///         file.write_all(&sample.to_le_bytes())?;
+///     }
+///     file.flush()?;
+///     file.rewind()?;
+///     Ok(())
+/// }
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let temp = tempdir()?;
+/// let input_path = temp.path().join("tone.wav");
+/// write_sine_wav(&input_path)?;
+/// let output_dir = temp.path().join("segments");
+///
+/// let config = Config::new(&input_path, &output_dir, 250, "part")?;
+/// run(config)?;
+///
+/// let mut produced: Vec<_> = fs::read_dir(&output_dir)?
+///     .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+///     .collect();
+/// produced.sort();
+/// assert!(!produced.is_empty());
+/// assert!(produced.iter().all(|name| name.contains("part")));
+/// # Ok(())
+/// # }
+/// ```
 pub fn run(config: Config) -> Result<(), AudioSplitError> {
     let mut hint = Hint::new();
     if let Some(extension) = config.input_path.extension().and_then(|ext| ext.to_str()) {
