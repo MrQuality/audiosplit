@@ -93,4 +93,8 @@ impl Assert {
         );
         self
     }
+
+    pub fn stdout(&self) -> &[u8] {
+        &self.output.stdout
+    }
 }
