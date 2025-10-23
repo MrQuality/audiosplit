@@ -1,7 +1,8 @@
-use audiosplit_core::{run, AudioSplitError, Config};
+use audiosplit_core::{run, run_with_metrics, AudioSplitError, Config, ProgressReporter};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -159,6 +160,46 @@ fn run_enforces_segment_limit() -> Result<(), Box<dyn Error>> {
         AudioSplitError::SegmentLimitExceeded { limit } => assert_eq!(limit, 50_000),
         other => panic!("unexpected error: {other:?}"),
     }
+
+    output_dir.close()?;
+    work_dir.close()?;
+    Ok(())
+}
+
+struct SilentProgress;
+
+impl ProgressReporter for SilentProgress {}
+
+#[test]
+fn run_limits_buffer_size_usage() -> Result<(), Box<dyn Error>> {
+    let work_dir = tempdir()?;
+    let input_path = work_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 1_100)?;
+
+    let output_dir = tempdir()?;
+    let buffer_frames = NonZeroUsize::new(32).expect("non-zero");
+    let config = Config::builder(
+        &input_path,
+        output_dir.path(),
+        Duration::from_millis(200),
+        "chunk",
+    )
+    .buffer_size_frames(buffer_frames)
+    .build()?;
+
+    let mut progress = SilentProgress;
+    let metrics = run_with_metrics(config, &mut progress)?;
+
+    assert!(
+        metrics.segments_written > 0,
+        "expected at least one segment"
+    );
+    assert!(
+        metrics.peak_frames_per_chunk <= buffer_frames.get(),
+        "peak frames {} exceeded buffer size {}",
+        metrics.peak_frames_per_chunk,
+        buffer_frames
+    );
 
     output_dir.close()?;
     work_dir.close()?;

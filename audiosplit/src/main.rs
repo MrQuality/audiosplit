@@ -1,5 +1,6 @@
 mod cli;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -27,10 +28,14 @@ fn main() {
             .get_one::<String>("postfix")
             .cloned()
             .unwrap_or_else(|| DEFAULT_POSTFIX.to_owned());
+        let buffer_frames = *matches
+            .get_one::<NonZeroUsize>("buffer-frames")
+            .expect("defaulted argument");
         let overwrite = matches.get_flag("overwrite");
         let dry_run = matches.get_flag("dry-run");
 
         let config = Config::builder(input_path, output_dir, segment_length, postfix)
+            .buffer_size_frames(buffer_frames)
             .create_output_dir(true)
             .overwrite(overwrite)
             .build()
