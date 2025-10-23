@@ -28,6 +28,7 @@ use thiserror::Error;
 
 /// Maximum number of segments produced from a single input file.
 const MAX_SEGMENTS: u64 = 50_000;
+const MIN_SEGMENT_PAD_WIDTH: usize = 4;
 /// Default number of frames pulled from the decoder in a single chunk.
 pub const OPTIMAL_DECODE_BUFFER_FRAMES: usize = 4_096;
 /// Default number of interleaved samples written to disk in a single chunk.
@@ -1074,7 +1075,8 @@ fn run_internal<P: ProgressReporter>(
             let segments = total.div_ceil(segment_length_frames);
             num_width(segments)
         })
-        .unwrap_or(1);
+        .unwrap_or(MIN_SEGMENT_PAD_WIDTH)
+        .max(MIN_SEGMENT_PAD_WIDTH);
     let dispatcher = SegmentDispatcher::new(config.threads);
     let naming = SegmentNaming {
         base_name,
@@ -1341,7 +1343,8 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
 
         self.segment_index += 1;
         self.segments_created += 1;
-        self.naming.pad_width = self.naming.pad_width.max(num_width(self.segment_index));
+        let required_width = num_width(self.segment_index).max(MIN_SEGMENT_PAD_WIDTH);
+        self.naming.pad_width = self.naming.pad_width.max(required_width);
 
         let writer_params = WriterParams {
             config: self.config,
