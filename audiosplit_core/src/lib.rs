@@ -405,7 +405,10 @@ fn query_available_space(path: &Path) -> io::Result<u64> {
         if result != 0 {
             Err(io::Error::last_os_error())
         } else {
-            Ok(u64::from(stat.f_frsize).saturating_mul(u64::from(stat.f_bavail)))
+            let block_size = u128::from(stat.f_frsize);
+            let available_blocks = u128::from(stat.f_bavail);
+            let bytes = block_size.saturating_mul(available_blocks);
+            Ok(bytes.min(u128::from(u64::MAX)) as u64)
         }
     }
 
@@ -779,16 +782,16 @@ fn run_internal<P: ProgressReporter>(
                         }
                         segment_index += 1;
                         pad_width = pad_width.max(num_width(segment_index));
-                        writer = create_writer(
-                            &config,
+                        let writer_params = WriterParams {
+                            config: &config,
                             base_name,
                             extension,
                             pad_width,
                             segment_index,
-                            &spec,
+                            signal_spec: spec,
                             segment_length_frames,
-                            execution,
-                        )?;
+                        };
+                        writer = create_writer(&writer_params, execution)?;
                     }
 
                     let remaining_in_segment =
@@ -842,36 +845,39 @@ fn num_width(mut value: u64) -> usize {
     width
 }
 
-fn create_writer(
-    config: &Config,
-    base_name: &str,
-    extension: &str,
+struct WriterParams<'a> {
+    config: &'a Config,
+    base_name: &'a str,
+    extension: &'a str,
     pad_width: usize,
     segment_index: u64,
-    signal_spec: &SignalSpec,
+    signal_spec: SignalSpec,
     segment_length_frames: u64,
+}
+
+fn create_writer(
+    params: &WriterParams,
     execution: &mut Execution,
 ) -> Result<Option<SegmentWriter>, AudioSplitError> {
+    let padded_index = format!("{:0width$}", params.segment_index, width = params.pad_width);
     let file_name = format!(
-        "{}_{}_{}.{extension}",
-        base_name,
-        config.postfix,
-        format_args!("{segment_index:0pad_width$}")
+        "{}_{}_{}.{}",
+        params.base_name, params.config.postfix, padded_index, params.extension
     );
 
-    let mut output_path = config.output_dir.clone();
+    let mut output_path = params.config.output_dir.clone();
     output_path.push(file_name);
 
-    if !output_path.starts_with(&config.output_dir) {
+    if !output_path.starts_with(&params.config.output_dir) {
         return Err(AudioSplitError::InvalidPath(output_path));
     }
 
-    ensure_output_dir_present(&config.output_dir)?;
-    ensure_can_write_file(&output_path, config.allow_overwrite)?;
+    ensure_output_dir_present(&params.config.output_dir)?;
+    ensure_can_write_file(&output_path, params.config.allow_overwrite)?;
 
     match execution {
         Execution::Write => {
-            let channel_count = signal_spec.channels.count();
+            let channel_count = params.signal_spec.channels.count();
             let channels = u16::try_from(channel_count)
                 .map_err(|_| AudioSplitError::UnsupportedChannelLayout)?;
 
@@ -879,15 +885,16 @@ fn create_writer(
                 .checked_mul(2)
                 .ok_or(AudioSplitError::UnsupportedChannelLayout)?
                 as u64;
-            let required_bytes = segment_length_frames.checked_mul(bytes_per_frame).ok_or(
-                AudioSplitError::InvalidSegmentLength {
+            let required_bytes = params
+                .segment_length_frames
+                .checked_mul(bytes_per_frame)
+                .ok_or(AudioSplitError::InvalidSegmentLength {
                     reason: SegmentLengthError::TooLarge,
-                },
-            )?;
+                })?;
 
-            ensure_available_disk_space(&config.output_dir, required_bytes)?;
+            ensure_available_disk_space(&params.config.output_dir, required_bytes)?;
 
-            SegmentWriter::create(output_path, signal_spec.rate, channels).map(Some)
+            SegmentWriter::create(output_path, params.signal_spec.rate, channels).map(Some)
         }
         Execution::DryRun(recorder) => {
             recorder.record(&output_path);
