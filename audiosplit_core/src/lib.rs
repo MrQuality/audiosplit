@@ -146,6 +146,10 @@ pub enum AudioSplitError {
     #[error("output directory does not exist: {0}")]
     MissingOutputDirectory(PathBuf),
 
+    /// Error returned when files cannot be written to the output directory.
+    #[error("output directory is not writable: {0}")]
+    OutputDirectoryNotWritable(PathBuf),
+
     /// Error returned when the destination lacks sufficient free space.
     #[error(
         "insufficient disk space in output directory {path}: required {required} bytes, only {available} bytes available"
@@ -409,6 +413,11 @@ fn check_write_permission(path: &Path) -> Result<(), AudioSplitError> {
                 match fs::remove_file(&candidate) {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                        return Err(AudioSplitError::OutputDirectoryNotWritable(
+                            path.to_path_buf(),
+                        ));
+                    }
                     Err(err) => return Err(AudioSplitError::Io(err)),
                 }
                 return Ok(());
@@ -418,13 +427,23 @@ fn check_write_permission(path: &Path) -> Result<(), AudioSplitError> {
                     return Err(AudioSplitError::Io(err));
                 }
             }
-            Err(err) => return Err(AudioSplitError::Io(err)),
+            Err(err) => match err.kind() {
+                io::ErrorKind::PermissionDenied => {
+                    return Err(AudioSplitError::OutputDirectoryNotWritable(
+                        path.to_path_buf(),
+                    ))
+                }
+                io::ErrorKind::NotFound => {
+                    return Err(AudioSplitError::MissingOutputDirectory(path.to_path_buf()))
+                }
+                _ => return Err(AudioSplitError::Io(err)),
+            },
         }
     }
 
-    Err(AudioSplitError::Io(io::Error::other(
-        "failed to create temporary file for permission check",
-    )))
+    Err(AudioSplitError::OutputDirectoryNotWritable(
+        path.to_path_buf(),
+    ))
 }
 
 fn ensure_output_dir_present(path: &Path) -> Result<(), AudioSplitError> {
@@ -1267,6 +1286,41 @@ mod tests {
     }
 
     #[test]
+    fn config_builder_rejects_missing_input_file() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let missing_input = temp_dir.path().join("missing.wav");
+        let output_dir = temp_dir.path().join("output");
+        fs::create_dir_all(&output_dir).expect("create output directory");
+
+        let err = Config::builder(&missing_input, &output_dir, Duration::from_secs(1), "part")
+            .build()
+            .expect_err("expected missing input rejection");
+
+        match err {
+            AudioSplitError::InvalidPath(path) => assert_eq!(path, missing_input),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_builder_rejects_missing_output_directory_when_creation_disabled() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+        let output_dir = temp_dir.path().join("missing/output");
+        assert!(!output_dir.exists(), "output directory should be missing");
+
+        let err = Config::builder(&input_path, &output_dir, Duration::from_secs(1), "part")
+            .build()
+            .expect_err("expected missing output directory rejection");
+
+        match err {
+            AudioSplitError::MissingOutputDirectory(path) => assert_eq!(path, output_dir),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn config_builder_rejects_zero_length_before_touching_output() {
         let temp_dir = tempdir().expect("create temp dir");
         let input_path = temp_dir.path().join("input.wav");
@@ -1492,10 +1546,47 @@ mod tests {
         let err = check_write_permission(&output_dir)
             .expect_err("read-only directory should be rejected");
 
-        if let AudioSplitError::Io(io_err) = err {
-            assert_eq!(io_err.kind(), io::ErrorKind::PermissionDenied);
-        } else {
-            panic!("unexpected error variant: {err:?}");
+        match err {
+            AudioSplitError::OutputDirectoryNotWritable(path) => assert_eq!(path, output_dir),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        let mut perms = fs::metadata(&output_dir)
+            .expect("refresh metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&output_dir, perms).expect("restore permissions");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_builder_rejects_unwritable_output_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping unwritable directory test for root user");
+            return;
+        }
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = temp_dir.path().join("readonly");
+        fs::create_dir_all(&output_dir).expect("create readonly dir");
+
+        let metadata = fs::metadata(&output_dir).expect("read metadata");
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&output_dir, perms).expect("set read-only permissions");
+
+        let err = Config::builder(&input_path, &output_dir, Duration::from_secs(1), "part")
+            .build()
+            .expect_err("expected unwritable directory rejection");
+
+        match err {
+            AudioSplitError::OutputDirectoryNotWritable(path) => assert_eq!(path, output_dir),
+            other => panic!("unexpected error: {other:?}"),
         }
 
         let mut perms = fs::metadata(&output_dir)
