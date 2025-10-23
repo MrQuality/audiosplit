@@ -1112,6 +1112,22 @@ mod tests {
     }
 
     #[test]
+    fn duration_to_frames_rejects_excessive_segment_length() {
+        let duration = Duration::from_secs(2);
+        let sample_rate = u64::MAX;
+
+        let err = duration_to_frames(duration, sample_rate)
+            .expect_err("expected conversion to reject overflow");
+
+        match err {
+            AudioSplitError::InvalidSegmentLength { reason } => {
+                assert_eq!(reason, SegmentLengthError::TooLarge);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn ensure_segment_limit_allows_exact_fit() {
         let segment_length = Duration::from_secs(1);
         let duration = Duration::from_secs(MAX_SEGMENTS);
@@ -1190,6 +1206,27 @@ mod tests {
 
         match err {
             AudioSplitError::InvalidPath(path) => assert_eq!(path, output_file),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_new_rejects_missing_output_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = temp_dir.path().join("segments");
+        assert!(
+            !output_dir.exists(),
+            "output directory should start missing"
+        );
+
+        let err = Config::new(&input_path, &output_dir, Duration::from_secs(1), "part")
+            .expect_err("expected missing output directory error");
+
+        match err {
+            AudioSplitError::MissingOutputDirectory(path) => assert_eq!(path, output_dir),
             other => panic!("unexpected error: {other:?}"),
         }
     }
