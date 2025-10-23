@@ -33,6 +33,16 @@ cargo test --all --all-features
 
 Pull requests that fail these checks cannot be merged. If you introduce new tooling or scripts, document them in this file.
 
+## Benchmarks
+
+Benchmarks live under `audiosplit_core/benches` and use generated audio fixtures so no binary assets are required. Run them with:
+
+```bash
+cargo bench -p audiosplit_core
+```
+
+The benchmark harness synthesizes WAV data on the fly, so no additional setup is necessary beyond having the Rust toolchain installed.
+
 ## Reporting Issues
 
 If you encounter a bug or have a feature request, open an issue with clear reproduction steps and expected behavior. Screenshots or log excerpts are helpful when available.
