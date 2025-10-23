@@ -120,8 +120,22 @@ fn cli_dry_run_outputs_plan_without_writing_files() -> Result<(), Box<dyn Error>
         .success();
 
     let stdout = String::from_utf8(assert.stdout().to_vec())?;
-    assert!(stdout.contains("Dry run - planned segments:"));
-    assert!(stdout.contains("input_part_1.wav"));
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("Dry run - planned segments:"),
+        "header should announce dry-run plan"
+    );
+    let entries: Vec<_> = lines.collect();
+    assert_eq!(
+        entries,
+        vec![
+            "  - input_part_1.wav",
+            "  - input_part_2.wav",
+            "  - input_part_3.wav"
+        ],
+        "dry-run output should list each segment on its own line"
+    );
 
     let produced: Vec<_> = fs::read_dir(output_dir.path())?.collect();
     assert!(produced.is_empty(), "dry-run should not write output files");
