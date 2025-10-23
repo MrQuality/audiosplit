@@ -914,7 +914,7 @@ struct ThreadPoolDispatcher {
 
 impl ThreadPoolDispatcher {
     fn new(workers: usize) -> Self {
-        let (job_sender, job_receiver) = mpsc::channel();
+        let (job_sender, job_receiver) = mpsc::channel::<SegmentEncodeJob>();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let (error_sender, error_receiver) = mpsc::channel();
 
