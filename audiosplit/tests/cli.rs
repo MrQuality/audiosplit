@@ -89,14 +89,85 @@ fn cli_reports_missing_input_file() -> Result<(), Box<dyn Error>> {
     let output_arg = output_dir.path().to_string_lossy().to_string();
 
     let mut cmd = Command::cargo_bin("audiosplit")?;
-    cmd.args(["--length", "400ms", "--output"])
+    let assert = cmd
+        .args(["--length", "400ms", "--output"])
         .arg(&output_arg)
-        .arg("missing.wav");
-    cmd.assert()
-        .failure()
-        .stderr_contains("invalid path: missing.wav");
+        .arg("missing.wav")
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8(assert.stderr().to_vec())?;
+    let expected = [
+        "Error: failed to create configuration for 'missing.wav'",
+        "Caused by:",
+        "  - invalid path: missing.wav",
+        "",
+        "Troubleshooting:",
+        "  - Verify the input file exists and that the path is spelled correctly.",
+        "  - If the path is relative, try providing an absolute path to the file.",
+    ]
+    .join("\n");
+    assert_eq!(stderr.trim_end(), expected);
 
     output_dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn cli_reports_existing_output_files() -> Result<(), Box<dyn Error>> {
+    let input_dir = tempdir()?;
+    let input_path = input_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 1_100)?;
+
+    let output_dir = tempdir()?;
+    let output_arg = output_dir.path().to_string_lossy().to_string();
+    let input_arg = input_path.to_string_lossy().to_string();
+
+    let mut initial = Command::cargo_bin("audiosplit")?;
+    initial
+        .args(["--length", "400ms", "--output"])
+        .arg(&output_arg)
+        .arg(&input_arg)
+        .assert()
+        .success();
+
+    let mut second = Command::cargo_bin("audiosplit")?;
+    let assert = second
+        .args(["--length", "400ms", "--output"])
+        .arg(&output_arg)
+        .arg(&input_arg)
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8(assert.stderr().to_vec())?;
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(lines.len(), 7, "unexpected stderr lines: {:?}", lines);
+    assert_eq!(
+        lines[0],
+        format!(
+            "Error: failed to create configuration for '{}'",
+            input_path.to_string_lossy()
+        )
+    );
+    assert_eq!(lines[1], "Caused by:");
+    assert!(
+        lines[2].starts_with("  - output file already exists: "),
+        "unexpected cause line: {}",
+        lines[2]
+    );
+    assert_eq!(lines[3], "");
+    assert_eq!(lines[4], "Troubleshooting:");
+    assert_eq!(
+        lines[5],
+        "  - Remove the existing segments from the output directory before re-running."
+    );
+    assert_eq!(
+        lines[6],
+        "  - Re-run with --overwrite to replace existing segments in place."
+    );
+
+    output_dir.close()?;
+    input_dir.close()?;
     Ok(())
 }
 

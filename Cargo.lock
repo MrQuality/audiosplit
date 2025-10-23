@@ -86,7 +86,6 @@ dependencies = [
  "audiosplit_core",
  "clap",
  "env_logger",
- "indicatif",
  "tempfile",
 ]
 
