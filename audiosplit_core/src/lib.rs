@@ -234,6 +234,7 @@ impl ConfigBuilder {
         validate_segment_length(self.segment_length)?;
         let input_path = canonicalize_existing_file(&self.input)?;
         let output_dir = ensure_output_directory(&self.output)?;
+        enforce_overwrite_rules(&output_dir, &input_path, &self.postfix, self.overwrite)?;
 
         Ok(Config {
             input_path,
@@ -286,6 +287,45 @@ fn ensure_output_directory(path: &Path) -> Result<PathBuf, AudioSplitError> {
 fn ensure_can_write_file(path: &Path, allow_overwrite: bool) -> Result<(), AudioSplitError> {
     if !allow_overwrite && path.exists() {
         return Err(AudioSplitError::OutputExists(path.to_path_buf()));
+    }
+
+    Ok(())
+}
+
+fn enforce_overwrite_rules(
+    output_dir: &Path,
+    input_path: &Path,
+    postfix: &str,
+    allow_overwrite: bool,
+) -> Result<(), AudioSplitError> {
+    if allow_overwrite {
+        return Ok(());
+    }
+
+    let Some(base_name) = input_path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(());
+    };
+    let Some(extension) = input_path.extension().and_then(|s| s.to_str()) else {
+        return Ok(());
+    };
+
+    let prefix = format!("{base_name}_{postfix}_");
+    let suffix = format!(".{extension}");
+
+    for entry in fs::read_dir(output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+
+        if name.starts_with(&prefix) && name.ends_with(&suffix) {
+            return Err(AudioSplitError::OutputExists(entry.path()));
+        }
     }
 
     Ok(())
@@ -855,6 +895,48 @@ mod tests {
             .expect("config should build");
 
         assert!(!config.allow_overwrite);
+    }
+
+    #[test]
+    fn config_builder_rejects_existing_segments_without_overwrite() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = temp_dir.path().join("segments");
+        fs::create_dir_all(&output_dir).expect("create output directory");
+        let existing_segment = output_dir.join("input_part_1.wav");
+        File::create(&existing_segment).expect("create existing segment");
+        let existing_segment = fs::canonicalize(existing_segment).expect("canonicalize segment");
+
+        let err = Config::builder(&input_path, &output_dir, Duration::from_secs(1), "part")
+            .build()
+            .expect_err("expected overwrite prevention");
+
+        match err {
+            AudioSplitError::OutputExists(path) => assert_eq!(path, existing_segment),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_builder_allows_existing_segments_with_overwrite_flag() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = temp_dir.path().join("segments");
+        fs::create_dir_all(&output_dir).expect("create output directory");
+        let existing_segment = output_dir.join("input_part_1.wav");
+        File::create(&existing_segment).expect("create existing segment");
+
+        let config = Config::builder(&input_path, &output_dir, Duration::from_secs(1), "part")
+            .overwrite(true)
+            .build()
+            .expect("overwrite flag should allow existing files");
+
+        assert!(config.allow_overwrite);
+        assert!(config.output_dir.ends_with("segments"));
     }
 
     #[test]
