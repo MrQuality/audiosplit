@@ -84,6 +84,39 @@ fn cli_splits_audio_into_segments_with_remainder() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn cli_splits_audio_with_explicit_threads() -> Result<(), Box<dyn Error>> {
+    let input_dir = tempdir()?;
+    let input_path = input_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 1_100)?;
+
+    let output_dir = tempdir()?;
+    let output_arg = output_dir.path().to_string_lossy().to_string();
+    let input_arg = input_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("audiosplit")?;
+    cmd.args(["--length", "400ms", "--threads", "2", "--output"])
+        .arg(&output_arg)
+        .arg(&input_arg);
+    cmd.assert().success();
+
+    let mut segments: Vec<_> = fs::read_dir(output_dir.path())?
+        .map(|entry| entry.map(|e| e.file_name().into_string().expect("utf-8 filename")))
+        .collect::<Result<_, _>>()?;
+    segments.sort();
+
+    let expected = vec![
+        "input_part_0001.wav".to_string(),
+        "input_part_0002.wav".to_string(),
+        "input_part_0003.wav".to_string(),
+    ];
+    assert_eq!(segments, expected, "unexpected segment names: {segments:?}");
+
+    output_dir.close()?;
+    input_dir.close()?;
+    Ok(())
+}
+
+#[test]
 fn cli_reports_missing_input_file() -> Result<(), Box<dyn Error>> {
     let output_dir = tempdir()?;
     let output_arg = output_dir.path().to_string_lossy().to_string();

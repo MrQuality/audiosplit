@@ -10,10 +10,10 @@
 use std::convert::TryFrom;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::mem;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal, SignalSpec};
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
@@ -178,6 +178,14 @@ pub enum AudioSplitError {
     /// Error returned when the configured write buffer cannot hold even a single frame.
     #[error("write buffer of {requested} samples cannot accommodate {channels} audio channels")]
     WriteBufferTooSmall { requested: usize, channels: usize },
+
+    /// Error returned when a background worker fails while encoding a segment.
+    #[error("segment encoding worker thread panicked")]
+    WorkerThreadPanicked,
+
+    /// Error returned when work cannot be scheduled because the worker pool has shut down.
+    #[error("segment encoding workers are unavailable")]
+    WorkerPoolShutDown,
 }
 
 /// Reasons why a segment length is considered invalid.
@@ -233,6 +241,8 @@ pub struct Config {
     pub buffer_size_frames: NonZeroUsize,
     /// Maximum number of interleaved samples buffered before writing to disk.
     pub write_buffer_samples: NonZeroUsize,
+    /// Number of worker threads used to encode completed segments.
+    pub threads: NonZeroUsize,
 }
 
 impl Config {
@@ -304,6 +314,7 @@ pub struct ConfigBuilder {
     create_output_dir: bool,
     buffer_size_frames: NonZeroUsize,
     write_buffer_samples: NonZeroUsize,
+    threads: NonZeroUsize,
 }
 
 impl ConfigBuilder {
@@ -325,6 +336,7 @@ impl ConfigBuilder {
                 .expect("default buffer size must be non-zero"),
             write_buffer_samples: NonZeroUsize::new(DEFAULT_WRITE_BUFFER_SAMPLES)
                 .expect("default write buffer size must be non-zero"),
+            threads: NonZeroUsize::new(1).expect("thread count default must be non-zero"),
         }
     }
 
@@ -352,6 +364,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Configure the number of worker threads used to encode completed segments.
+    pub fn threads(mut self, threads: NonZeroUsize) -> Self {
+        self.threads = threads;
+        self
+    }
+
     /// Finalize the builder, validating paths and constructing the [`Config`].
     pub fn build(self) -> Result<Config, AudioSplitError> {
         validate_segment_length(self.segment_length)?;
@@ -368,6 +386,7 @@ impl ConfigBuilder {
             allow_overwrite: self.overwrite,
             buffer_size_frames: self.buffer_size_frames,
             write_buffer_samples: self.write_buffer_samples,
+            threads: self.threads,
         })
     }
 }
@@ -807,6 +826,175 @@ pub struct SplitMetrics {
     pub peak_samples_per_chunk: usize,
 }
 
+struct SegmentEncodeJob {
+    writer: SegmentWriter,
+    chunks: Vec<Vec<i16>>,
+}
+
+impl SegmentEncodeJob {
+    fn new(writer: SegmentWriter, chunks: Vec<Vec<i16>>) -> Self {
+        Self { writer, chunks }
+    }
+
+    fn execute(mut self) -> Result<(), AudioSplitError> {
+        for chunk in self.chunks {
+            self.writer.write_samples(&chunk)?;
+        }
+        self.writer.finalize()
+    }
+}
+
+struct ActiveSegment {
+    writer: SegmentWriter,
+    chunks: Vec<Vec<i16>>,
+}
+
+impl ActiveSegment {
+    fn new(writer: SegmentWriter) -> Self {
+        Self {
+            writer,
+            chunks: Vec::new(),
+        }
+    }
+
+    fn into_job(self) -> SegmentEncodeJob {
+        SegmentEncodeJob::new(self.writer, self.chunks)
+    }
+
+    fn push_chunk(&mut self, chunk: Vec<i16>) {
+        self.chunks.push(chunk);
+    }
+}
+
+struct SegmentDispatcher {
+    strategy: SegmentDispatchStrategy,
+}
+
+impl SegmentDispatcher {
+    fn new(thread_count: NonZeroUsize) -> Self {
+        if thread_count.get() <= 1 {
+            Self {
+                strategy: SegmentDispatchStrategy::Inline,
+            }
+        } else {
+            Self {
+                strategy: SegmentDispatchStrategy::ThreadPool(ThreadPoolDispatcher::new(
+                    thread_count.get(),
+                )),
+            }
+        }
+    }
+
+    fn submit(&self, job: SegmentEncodeJob) -> Result<(), AudioSplitError> {
+        match &self.strategy {
+            SegmentDispatchStrategy::Inline => job.execute(),
+            SegmentDispatchStrategy::ThreadPool(pool) => pool.submit(job),
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), AudioSplitError> {
+        match &mut self.strategy {
+            SegmentDispatchStrategy::Inline => Ok(()),
+            SegmentDispatchStrategy::ThreadPool(pool) => pool.finish(),
+        }
+    }
+}
+
+enum SegmentDispatchStrategy {
+    Inline,
+    ThreadPool(ThreadPoolDispatcher),
+}
+
+struct ThreadPoolDispatcher {
+    sender: Mutex<Option<mpsc::Sender<SegmentEncodeJob>>>,
+    receiver: Arc<Mutex<mpsc::Receiver<SegmentEncodeJob>>>,
+    error_receiver: mpsc::Receiver<AudioSplitError>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ThreadPoolDispatcher {
+    fn new(workers: usize) -> Self {
+        let (job_sender, job_receiver) = mpsc::channel();
+        let job_receiver = Arc::new(Mutex::new(job_receiver));
+        let (error_sender, error_receiver) = mpsc::channel();
+
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let receiver = Arc::clone(&job_receiver);
+            let error_tx = error_sender.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("audiosplit-segment-{index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let guard = receiver.lock().expect("receiver mutex poisoned");
+                        guard.recv()
+                    };
+                    match job {
+                        Ok(job) => {
+                            if let Err(err) = job.execute() {
+                                let _ = error_tx.send(err);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                })
+                .expect("failed to spawn segment worker");
+            handles.push(handle);
+        }
+
+        drop(error_sender);
+
+        Self {
+            sender: Mutex::new(Some(job_sender)),
+            receiver: job_receiver,
+            error_receiver,
+            handles,
+        }
+    }
+
+    fn submit(&self, job: SegmentEncodeJob) -> Result<(), AudioSplitError> {
+        let sender = {
+            let guard = self.sender.lock().expect("sender mutex poisoned");
+            guard.clone()
+        };
+
+        if let Some(sender) = sender {
+            if sender.send(job).is_err() {
+                if let Ok(err) = self.error_receiver.try_recv() {
+                    return Err(err);
+                }
+                return Err(AudioSplitError::WorkerPoolShutDown);
+            }
+
+            if let Ok(err) = self.error_receiver.try_recv() {
+                return Err(err);
+            }
+
+            Ok(())
+        } else {
+            Err(AudioSplitError::WorkerPoolShutDown)
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), AudioSplitError> {
+        if let Some(sender) = self.sender.lock().expect("sender mutex poisoned").take() {
+            drop(sender);
+        }
+
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                return Err(AudioSplitError::WorkerThreadPanicked);
+            }
+        }
+
+        if let Ok(err) = self.error_receiver.try_recv() {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+}
+
 fn run_internal<P: ProgressReporter>(
     config: Config,
     execution: &mut Execution,
@@ -889,6 +1077,7 @@ fn run_internal<P: ProgressReporter>(
             num_width(segments)
         })
         .unwrap_or(1);
+    let dispatcher = SegmentDispatcher::new(config.threads);
     let splitter = StreamingSplitter::new(
         execution,
         &config,
@@ -897,6 +1086,7 @@ fn run_internal<P: ProgressReporter>(
         pad_width,
         segment_length_frames,
         sample_rate,
+        dispatcher,
     );
 
     let metrics = splitter.run(reader, decoder, progress)?;
@@ -922,7 +1112,8 @@ struct StreamingSplitter<'exec, 'recorder, 'cfg> {
     frames_in_segment: u64,
     segment_index: u64,
     total_frames_processed: u64,
-    writer: Option<SegmentWriter>,
+    dispatcher: SegmentDispatcher,
+    active_segment: Option<ActiveSegment>,
     work_buffer: Vec<i16>,
     peak_frames_per_chunk: usize,
     peak_samples_per_chunk: usize,
@@ -938,6 +1129,7 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         pad_width: usize,
         segment_length_frames: u64,
         sample_rate: u64,
+        dispatcher: SegmentDispatcher,
     ) -> Self {
         Self {
             execution,
@@ -952,7 +1144,8 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             frames_in_segment: 0,
             segment_index: 0,
             total_frames_processed: 0,
-            writer: None,
+            dispatcher,
+            active_segment: None,
             work_buffer: Vec::with_capacity(config.write_buffer_samples.get()),
             peak_frames_per_chunk: 0,
             peak_samples_per_chunk: 0,
@@ -966,22 +1159,32 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         mut decoder: Box<dyn Decoder>,
         progress: &mut P,
     ) -> Result<SplitMetrics, AudioSplitError> {
-        while let Ok(packet) = reader.next_packet() {
-            match decoder.decode(&packet) {
-                Ok(decoded) => self.process_decoded_buffer(decoded, progress)?,
-                Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(err) => return Err(AudioSplitError::from(err)),
+        let run_result = (|| -> Result<SplitMetrics, AudioSplitError> {
+            while let Ok(packet) = reader.next_packet() {
+                match decoder.decode(&packet) {
+                    Ok(decoded) => self.process_decoded_buffer(decoded, progress)?,
+                    Err(SymphoniaError::DecodeError(_)) => continue,
+                    Err(err) => return Err(AudioSplitError::from(err)),
+                }
             }
+
+            self.finalize_active_segment()?;
+
+            Ok(SplitMetrics {
+                total_frames_processed: self.total_frames_processed,
+                segments_written: self.segments_created,
+                peak_frames_per_chunk: self.peak_frames_per_chunk,
+                peak_samples_per_chunk: self.peak_samples_per_chunk,
+            })
+        })();
+
+        let finish_result = self.dispatcher.finish();
+
+        match (run_result, finish_result) {
+            (Ok(metrics), Ok(())) => Ok(metrics),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
         }
-
-        self.finalize_active_writer()?;
-
-        Ok(SplitMetrics {
-            total_frames_processed: self.total_frames_processed,
-            segments_written: self.segments_created,
-            peak_frames_per_chunk: self.peak_frames_per_chunk,
-            peak_samples_per_chunk: self.peak_samples_per_chunk,
-        })
     }
 
     fn process_decoded_buffer<P: ProgressReporter>(
@@ -1040,10 +1243,29 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         let frames_per_write_chunk = self.write_buffer_samples / channel_count;
         let frames_per_write_chunk = frames_per_write_chunk.max(1);
         while frame_index < total_frames {
-            let frames_to_take = self
+            if self.frames_in_segment >= self.segment_length_frames {
+                self.finalize_active_segment()?;
+            }
+
+            let remaining_in_segment = self
+                .segment_length_frames
+                .saturating_sub(self.frames_in_segment);
+            if remaining_in_segment == 0 {
+                self.finalize_active_segment()?;
+                continue;
+            }
+
+            let remaining_in_segment = usize::try_from(remaining_in_segment).unwrap_or(usize::MAX);
+            let mut frames_to_take = self
                 .buffer_size_frames
                 .min(total_frames.saturating_sub(frame_index))
-                .min(frames_per_write_chunk);
+                .min(frames_per_write_chunk)
+                .min(remaining_in_segment);
+
+            if frames_to_take == 0 {
+                frames_to_take = remaining_in_segment.min(total_frames.saturating_sub(frame_index));
+            }
+
             let frames_to_take = frames_to_take.max(1);
             self.peak_frames_per_chunk = self.peak_frames_per_chunk.max(frames_to_take);
 
@@ -1063,10 +1285,8 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
 
             self.peak_samples_per_chunk = self.peak_samples_per_chunk.max(self.work_buffer.len());
 
-            let samples = mem::take(&mut self.work_buffer);
-            self.write_samples(spec, channel_count, frames_to_take as u64, &samples)?;
-            self.work_buffer = samples;
-            self.work_buffer.clear();
+            let samples = self.work_buffer.split_off(0);
+            self.write_samples(spec, channel_count, frames_to_take as u64, samples)?;
             frame_index += frames_to_take;
         }
 
@@ -1083,48 +1303,31 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         spec: SignalSpec,
         channel_count: usize,
         frames: u64,
-        samples: &[i16],
+        samples: Vec<i16>,
     ) -> Result<(), AudioSplitError> {
-        if frames == 0 || channel_count == 0 {
+        if frames == 0 || channel_count == 0 || samples.is_empty() {
             return Ok(());
         }
 
-        let mut frames_remaining = frames;
-        let mut sample_offset: usize = 0;
+        self.ensure_active_segment(spec)?;
 
-        while frames_remaining > 0 {
-            if self.frames_in_segment >= self.segment_length_frames {
-                self.finalize_active_writer()?;
-            }
-
-            if self.writer.is_none() {
-                self.start_new_segment(spec)?;
-            }
-
-            let remaining_in_segment = self
-                .segment_length_frames
-                .saturating_sub(self.frames_in_segment);
-            if remaining_in_segment == 0 {
-                self.finalize_active_writer()?;
-                continue;
-            }
-
-            let frames_to_write = frames_remaining.min(remaining_in_segment);
-            let samples_to_write = frames_to_write as usize * channel_count;
-            let end = sample_offset + samples_to_write;
-            if let Some(writer) = self.writer.as_mut() {
-                writer.write_samples(&samples[sample_offset..end])?;
-            }
-
-            sample_offset = end;
-            frames_remaining -= frames_to_write;
-            self.frames_in_segment += frames_to_write;
-
-            if self.frames_in_segment >= self.segment_length_frames {
-                self.finalize_active_writer()?;
-            }
+        if let Some(active) = self.active_segment.as_mut() {
+            active.push_chunk(samples);
         }
 
+        self.frames_in_segment = self.frames_in_segment.saturating_add(frames);
+
+        if self.frames_in_segment >= self.segment_length_frames {
+            self.finalize_active_segment()?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_active_segment(&mut self, spec: SignalSpec) -> Result<(), AudioSplitError> {
+        if self.active_segment.is_none() {
+            self.start_new_segment(spec)?;
+        }
         Ok(())
     }
 
@@ -1148,13 +1351,21 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             signal_spec: spec,
             segment_length_frames: self.segment_length_frames,
         };
-        self.writer = create_writer(&writer_params, self.execution)?;
+        self.active_segment =
+            create_writer(&writer_params, self.execution)?.map(ActiveSegment::new);
+        self.frames_in_segment = 0;
         Ok(())
     }
 
-    fn finalize_active_writer(&mut self) -> Result<(), AudioSplitError> {
-        if self.writer.is_some() {
-            finalize_writer(&mut self.writer)?;
+    fn finalize_active_segment(&mut self) -> Result<(), AudioSplitError> {
+        if let Some(active) = self.active_segment.take() {
+            let job = active.into_job();
+            match self.execution {
+                Execution::Write => self.dispatcher.submit(job)?,
+                Execution::DryRun(_) => {
+                    job.execute()?;
+                }
+            }
         }
         self.frames_in_segment = 0;
         Ok(())
@@ -1230,13 +1441,6 @@ fn create_writer(
             Ok(Some(SegmentWriter::dry()))
         }
     }
-}
-
-fn finalize_writer(writer: &mut Option<SegmentWriter>) -> Result<(), AudioSplitError> {
-    if let Some(active) = writer.take() {
-        active.finalize()?;
-    }
-    Ok(())
 }
 
 enum SegmentWriter {

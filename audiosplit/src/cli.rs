@@ -78,6 +78,14 @@ pub fn build_cli() -> Command {
                 .default_value(DEFAULT_WRITE_BUFFER_SAMPLES_STR),
         )
         .arg(
+            Arg::new("threads")
+                .long("threads")
+                .value_name("THREADS")
+                .help("Number of worker threads used to encode finished segments (1 disables parallelism)")
+                .value_parser(value_parser!(NonZeroUsize))
+                .default_value("1"),
+        )
+        .arg(
             Arg::new("overwrite")
                 .long("overwrite")
                 .help("Allow overwriting existing files in the output directory")

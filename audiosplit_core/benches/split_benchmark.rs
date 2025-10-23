@@ -1,6 +1,7 @@
 use std::f32::consts::TAU;
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -114,28 +115,37 @@ fn split_benchmarks(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("audio_split");
 
+    let thread_counts = [NonZeroUsize::new(1).unwrap(), NonZeroUsize::new(4).unwrap()];
+
     for scenario in scenarios {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(scenario.name),
-            &scenario.segment_length,
-            |b, &segment_length| {
-                b.iter_batched(
-                    || {
-                        let output = tempfile::tempdir().expect("failed to create output dir");
-                        let config =
-                            Config::builder(fixture.path(), output.path(), segment_length, "bench")
-                                .overwrite(true)
-                                .build()
-                                .expect("failed to build config");
-                        (config, output)
-                    },
-                    |(config, _output)| {
-                        run(config).expect("split run failed");
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        for &threads in &thread_counts {
+            group.bench_with_input(
+                BenchmarkId::new(scenario.name, format!("{}-threads", threads.get())),
+                &scenario.segment_length,
+                |b, &segment_length| {
+                    b.iter_batched(
+                        || {
+                            let output = tempfile::tempdir().expect("failed to create output dir");
+                            let config = Config::builder(
+                                fixture.path(),
+                                output.path(),
+                                segment_length,
+                                "bench",
+                            )
+                            .overwrite(true)
+                            .threads(threads)
+                            .build()
+                            .expect("failed to build config");
+                            (config, output)
+                        },
+                        |(config, _output)| {
+                            run(config).expect("split run failed");
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
     }
 
     group.finish();
