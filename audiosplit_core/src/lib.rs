@@ -10,21 +10,25 @@
 use std::convert::TryFrom;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::mem;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use symphonia::core::audio::{SampleBuffer, SignalSpec};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal, SignalSpec};
+use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::{conv::FromSample, sample::Sample};
 use symphonia::default::{get_codecs, get_probe};
 use thiserror::Error;
 
 /// Maximum number of segments produced from a single input file.
 const MAX_SEGMENTS: u64 = 50_000;
+pub const DEFAULT_BUFFER_FRAMES: usize = 4_096;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// Trait used to relay progress information while splitting audio files.
@@ -130,6 +134,10 @@ pub enum AudioSplitError {
     #[error("unsupported codec")]
     UnsupportedCodec,
 
+    /// Error returned when the decoded sample format cannot be processed.
+    #[error("unsupported sample format")]
+    UnsupportedSampleFormat,
+
     /// Error produced when a file name cannot be derived from the input path.
     #[error("failed to derive a base name for the input file")]
     InvalidInputName,
@@ -210,6 +218,8 @@ pub struct Config {
     pub postfix: String,
     /// Whether existing output files may be overwritten.
     pub allow_overwrite: bool,
+    /// Maximum number of frames buffered in memory before flushing to disk.
+    pub buffer_size_frames: NonZeroUsize,
 }
 
 impl Config {
@@ -279,6 +289,7 @@ pub struct ConfigBuilder {
     postfix: String,
     overwrite: bool,
     create_output_dir: bool,
+    buffer_size_frames: NonZeroUsize,
 }
 
 impl ConfigBuilder {
@@ -296,6 +307,8 @@ impl ConfigBuilder {
             postfix: postfix.into(),
             overwrite: false,
             create_output_dir: false,
+            buffer_size_frames: NonZeroUsize::new(DEFAULT_BUFFER_FRAMES)
+                .expect("default buffer size must be non-zero"),
         }
     }
 
@@ -308,6 +321,12 @@ impl ConfigBuilder {
     /// Allow or forbid creating the output directory when it does not exist.
     pub fn create_output_dir(mut self, allow: bool) -> Self {
         self.create_output_dir = allow;
+        self
+    }
+
+    /// Configure the number of frames held in memory before flushing to disk.
+    pub fn buffer_size_frames(mut self, frames: NonZeroUsize) -> Self {
+        self.buffer_size_frames = frames;
         self
     }
 
@@ -325,6 +344,7 @@ impl ConfigBuilder {
             segment_length: self.segment_length,
             postfix: self.postfix,
             allow_overwrite: self.overwrite,
+            buffer_size_frames: self.buffer_size_frames,
         })
     }
 }
@@ -719,7 +739,7 @@ fn ensure_segment_limit(
 pub fn run(config: Config) -> Result<(), AudioSplitError> {
     let mut progress = NoProgressReporter;
     let mut execution = Execution::Write;
-    run_internal(config, &mut execution, &mut progress)
+    run_internal(config, &mut execution, &mut progress).map(|_| ())
 }
 
 /// Execute the split operation while reporting progress to the provided reporter.
@@ -727,6 +747,15 @@ pub fn run_with_progress<P: ProgressReporter>(
     config: Config,
     progress: &mut P,
 ) -> Result<(), AudioSplitError> {
+    let mut execution = Execution::Write;
+    run_internal(config, &mut execution, progress).map(|_| ())
+}
+
+/// Execute the split operation and return metrics describing the run.
+pub fn run_with_metrics<P: ProgressReporter>(
+    config: Config,
+    progress: &mut P,
+) -> Result<SplitMetrics, AudioSplitError> {
     let mut execution = Execution::Write;
     run_internal(config, &mut execution, progress)
 }
@@ -742,11 +771,24 @@ pub fn dry_run(config: Config) -> Result<Vec<PathBuf>, AudioSplitError> {
     Ok(recorder.segments)
 }
 
+/// Metrics captured during a streaming split operation.
+#[derive(Clone, Debug, Default)]
+pub struct SplitMetrics {
+    /// Total number of frames processed across all segments.
+    pub total_frames_processed: u64,
+    /// Number of segments written (or planned during a dry run).
+    pub segments_written: u64,
+    /// Maximum number of frames buffered at once before flushing to disk.
+    pub peak_frames_per_chunk: usize,
+    /// Maximum number of interleaved samples buffered at once.
+    pub peak_samples_per_chunk: usize,
+}
+
 fn run_internal<P: ProgressReporter>(
     config: Config,
     execution: &mut Execution,
     progress: &mut P,
-) -> Result<(), AudioSplitError> {
+) -> Result<SplitMetrics, AudioSplitError> {
     let mut hint = Hint::new();
     if let Some(extension) = config.input_path.extension().and_then(|ext| ext.to_str()) {
         hint.with_extension(extension);
@@ -767,7 +809,7 @@ fn run_internal<P: ProgressReporter>(
         }
         Err(err) => return Err(AudioSplitError::from(err)),
     };
-    let mut reader = probed.format;
+    let reader = probed.format;
 
     let track = reader
         .default_track()
@@ -797,28 +839,26 @@ fn run_internal<P: ProgressReporter>(
 
     progress.start(total_duration);
 
-    let mut decoder = match get_codecs().make(&track.codec_params, &DecoderOptions::default()) {
+    let decoder = match get_codecs().make(&track.codec_params, &DecoderOptions::default()) {
         Ok(decoder) => decoder,
         Err(SymphoniaError::Unsupported(_)) => return Err(AudioSplitError::UnsupportedCodec),
         Err(err) => return Err(AudioSplitError::from(err)),
     };
-
-    let mut frames_in_segment: u64 = 0;
-    let mut segment_index: u64 = 0;
-    let mut total_frames_processed: u64 = 0;
 
     let base_name = config
         .input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or(AudioSplitError::InvalidInputName)?;
+    let base_name = base_name.to_owned();
     let extension = config
         .input_path
         .extension()
         .and_then(|s| s.to_str())
         .ok_or(AudioSplitError::InvalidInputName)?;
+    let extension = extension.to_owned();
 
-    let mut pad_width = track
+    let pad_width = track
         .codec_params
         .n_frames
         .map(|total| {
@@ -826,93 +866,264 @@ fn run_internal<P: ProgressReporter>(
             num_width(segments)
         })
         .unwrap_or(1);
+    let splitter = StreamingSplitter::new(
+        execution,
+        &config,
+        base_name,
+        extension,
+        pad_width,
+        segment_length_frames,
+        sample_rate,
+    );
 
-    let mut sample_buffer: Option<SampleBuffer<i16>> = None;
-    let mut writer: Option<SegmentWriter> = None;
+    let metrics = splitter.run(reader, decoder, progress)?;
 
-    while let Ok(packet) = reader.next_packet() {
-        match decoder.decode(&packet) {
-            Ok(decoded) => {
-                let spec = *decoded.spec();
-                let total_frames = decoded.frames();
-                let capacity = decoded.capacity();
-
-                total_frames_processed = total_frames_processed.saturating_add(total_frames as u64);
-
-                let buffer = sample_buffer
-                    .get_or_insert_with(|| SampleBuffer::<i16>::new(capacity as u64, spec));
-                buffer.copy_interleaved_ref(decoded);
-
-                let channel_count = spec.channels.count();
-                if channel_count == 0 {
-                    continue;
-                }
-
-                let mut frame_offset: usize = 0;
-                let samples = buffer.samples();
-
-                while frame_offset < total_frames {
-                    if frames_in_segment >= segment_length_frames {
-                        finalize_writer(&mut writer)?;
-                        frames_in_segment = 0;
-                    }
-
-                    if writer.is_none() {
-                        if segment_index >= MAX_SEGMENTS {
-                            return Err(AudioSplitError::SegmentLimitExceeded {
-                                limit: MAX_SEGMENTS,
-                            });
-                        }
-                        segment_index += 1;
-                        pad_width = pad_width.max(num_width(segment_index));
-                        let writer_params = WriterParams {
-                            config: &config,
-                            base_name,
-                            extension,
-                            pad_width,
-                            segment_index,
-                            signal_spec: spec,
-                            segment_length_frames,
-                        };
-                        writer = create_writer(&writer_params, execution)?;
-                    }
-
-                    let remaining_in_segment =
-                        segment_length_frames.saturating_sub(frames_in_segment);
-                    let frames_available = total_frames as u64 - frame_offset as u64;
-                    let frames_to_write = remaining_in_segment.min(frames_available);
-
-                    let start_sample = frame_offset * channel_count;
-                    let end_sample = start_sample + frames_to_write as usize * channel_count;
-                    if let Some(active) = writer.as_mut() {
-                        active.write_samples(&samples[start_sample..end_sample])?;
-                    }
-
-                    frame_offset += frames_to_write as usize;
-                    frames_in_segment += frames_to_write;
-
-                    if frames_in_segment >= segment_length_frames {
-                        finalize_writer(&mut writer)?;
-                        frames_in_segment = 0;
-                    }
-                }
-            }
-            Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(err) => return Err(AudioSplitError::from(err)),
-        }
-
-        let processed_duration = frames_to_duration(total_frames_processed, sample_rate);
-        progress.update(processed_duration);
-    }
-
-    finalize_writer(&mut writer)?;
-
-    let duration = frames_to_duration(total_frames_processed, sample_rate);
+    let duration = frames_to_duration(metrics.total_frames_processed, sample_rate);
     ensure_segment_limit(duration, config.segment_length)?;
 
     progress.finish();
 
-    Ok(())
+    Ok(metrics)
+}
+
+struct StreamingSplitter<'exec, 'recorder, 'cfg> {
+    execution: &'exec mut Execution<'recorder>,
+    config: &'cfg Config,
+    base_name: String,
+    extension: String,
+    pad_width: usize,
+    segment_length_frames: u64,
+    sample_rate: u64,
+    buffer_size_frames: usize,
+    frames_in_segment: u64,
+    segment_index: u64,
+    total_frames_processed: u64,
+    writer: Option<SegmentWriter>,
+    work_buffer: Vec<i16>,
+    peak_frames_per_chunk: usize,
+    peak_samples_per_chunk: usize,
+    segments_created: u64,
+}
+
+impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
+    fn new(
+        execution: &'exec mut Execution<'recorder>,
+        config: &'cfg Config,
+        base_name: String,
+        extension: String,
+        pad_width: usize,
+        segment_length_frames: u64,
+        sample_rate: u64,
+    ) -> Self {
+        Self {
+            execution,
+            config,
+            base_name,
+            extension,
+            pad_width,
+            segment_length_frames,
+            sample_rate,
+            buffer_size_frames: config.buffer_size_frames.get(),
+            frames_in_segment: 0,
+            segment_index: 0,
+            total_frames_processed: 0,
+            writer: None,
+            work_buffer: Vec::with_capacity(config.buffer_size_frames.get()),
+            peak_frames_per_chunk: 0,
+            peak_samples_per_chunk: 0,
+            segments_created: 0,
+        }
+    }
+
+    fn run<P: ProgressReporter>(
+        mut self,
+        mut reader: Box<dyn FormatReader>,
+        mut decoder: Box<dyn Decoder>,
+        progress: &mut P,
+    ) -> Result<SplitMetrics, AudioSplitError> {
+        while let Ok(packet) = reader.next_packet() {
+            match decoder.decode(&packet) {
+                Ok(decoded) => self.process_decoded_buffer(decoded, progress)?,
+                Err(SymphoniaError::DecodeError(_)) => continue,
+                Err(err) => return Err(AudioSplitError::from(err)),
+            }
+        }
+
+        self.finalize_active_writer()?;
+
+        Ok(SplitMetrics {
+            total_frames_processed: self.total_frames_processed,
+            segments_written: self.segments_created,
+            peak_frames_per_chunk: self.peak_frames_per_chunk,
+            peak_samples_per_chunk: self.peak_samples_per_chunk,
+        })
+    }
+
+    fn process_decoded_buffer<P: ProgressReporter>(
+        &mut self,
+        decoded: AudioBufferRef<'_>,
+        progress: &mut P,
+    ) -> Result<(), AudioSplitError> {
+        match decoded {
+            AudioBufferRef::U8(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::U16(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::U24(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::U32(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::S8(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::S16(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::S24(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::S32(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::F32(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+            AudioBufferRef::F64(buf) => self.process_typed_buffer(buf.as_ref(), progress),
+        }
+    }
+
+    fn process_typed_buffer<S, P>(
+        &mut self,
+        buffer: &AudioBuffer<S>,
+        progress: &mut P,
+    ) -> Result<(), AudioSplitError>
+    where
+        S: Sample + Copy,
+        i16: FromSample<S>,
+        P: ProgressReporter,
+    {
+        let spec = *buffer.spec();
+        let channel_count = spec.channels.count();
+        if channel_count == 0 {
+            return Ok(());
+        }
+
+        let total_frames = buffer.frames();
+        if total_frames == 0 {
+            return Ok(());
+        }
+
+        let mut channel_slices = Vec::with_capacity(channel_count);
+        for channel in 0..channel_count {
+            channel_slices.push(buffer.chan(channel));
+        }
+
+        let mut frame_index = 0;
+        while frame_index < total_frames {
+            let frames_to_take = self
+                .buffer_size_frames
+                .min(total_frames.saturating_sub(frame_index));
+            let frames_to_take = frames_to_take.max(1);
+            self.peak_frames_per_chunk = self.peak_frames_per_chunk.max(frames_to_take);
+
+            let required_samples = frames_to_take * channel_count;
+            if self.work_buffer.capacity() < required_samples {
+                self.work_buffer
+                    .reserve(required_samples - self.work_buffer.capacity());
+            }
+            self.work_buffer.clear();
+
+            for frame in frame_index..frame_index + frames_to_take {
+                for channel_slice in &channel_slices {
+                    let sample = channel_slice[frame];
+                    self.work_buffer.push(i16::from_sample(sample));
+                }
+            }
+
+            self.peak_samples_per_chunk = self.peak_samples_per_chunk.max(self.work_buffer.len());
+
+            let samples = mem::take(&mut self.work_buffer);
+            self.write_samples(spec, channel_count, frames_to_take as u64, &samples)?;
+            self.work_buffer = samples;
+            self.work_buffer.clear();
+            frame_index += frames_to_take;
+        }
+
+        self.total_frames_processed = self
+            .total_frames_processed
+            .saturating_add(total_frames as u64);
+        let processed_duration = frames_to_duration(self.total_frames_processed, self.sample_rate);
+        progress.update(processed_duration);
+        Ok(())
+    }
+
+    fn write_samples(
+        &mut self,
+        spec: SignalSpec,
+        channel_count: usize,
+        frames: u64,
+        samples: &[i16],
+    ) -> Result<(), AudioSplitError> {
+        if frames == 0 || channel_count == 0 {
+            return Ok(());
+        }
+
+        let mut frames_remaining = frames;
+        let mut sample_offset: usize = 0;
+
+        while frames_remaining > 0 {
+            if self.frames_in_segment >= self.segment_length_frames {
+                self.finalize_active_writer()?;
+            }
+
+            if self.writer.is_none() {
+                self.start_new_segment(spec)?;
+            }
+
+            let remaining_in_segment = self
+                .segment_length_frames
+                .saturating_sub(self.frames_in_segment);
+            if remaining_in_segment == 0 {
+                self.finalize_active_writer()?;
+                continue;
+            }
+
+            let frames_to_write = frames_remaining.min(remaining_in_segment);
+            let samples_to_write = frames_to_write as usize * channel_count;
+            let end = sample_offset + samples_to_write;
+            if let Some(writer) = self.writer.as_mut() {
+                writer.write_samples(&samples[sample_offset..end])?;
+            }
+
+            sample_offset = end;
+            frames_remaining -= frames_to_write;
+            self.frames_in_segment += frames_to_write;
+
+            if self.frames_in_segment >= self.segment_length_frames {
+                self.finalize_active_writer()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn start_new_segment(&mut self, spec: SignalSpec) -> Result<(), AudioSplitError> {
+        if self.segment_index >= MAX_SEGMENTS {
+            return Err(AudioSplitError::SegmentLimitExceeded {
+                limit: MAX_SEGMENTS,
+            });
+        }
+
+        self.segment_index += 1;
+        self.segments_created += 1;
+        self.pad_width = self.pad_width.max(num_width(self.segment_index));
+
+        let writer_params = WriterParams {
+            config: self.config,
+            base_name: &self.base_name,
+            extension: &self.extension,
+            pad_width: self.pad_width,
+            segment_index: self.segment_index,
+            signal_spec: spec,
+            segment_length_frames: self.segment_length_frames,
+        };
+        self.writer = create_writer(&writer_params, self.execution)?;
+        Ok(())
+    }
+
+    fn finalize_active_writer(&mut self) -> Result<(), AudioSplitError> {
+        if self.writer.is_some() {
+            finalize_writer(&mut self.writer)?;
+        }
+        self.frames_in_segment = 0;
+        Ok(())
+    }
 }
 
 fn num_width(mut value: u64) -> usize {

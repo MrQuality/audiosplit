@@ -1,4 +1,6 @@
+use audiosplit_core::DEFAULT_BUFFER_FRAMES;
 use clap::{builder::ValueParser, value_parser, Arg, ArgAction, Command};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 mod duration;
@@ -12,8 +14,16 @@ const LENGTH_HELP: &str = concat!(
 );
 
 pub const DEFAULT_POSTFIX: &str = "part";
+const DEFAULT_BUFFER_FRAMES_STR: &str = "4096";
 
 pub fn build_cli() -> Command {
+    debug_assert_eq!(
+        DEFAULT_BUFFER_FRAMES_STR
+            .parse::<usize>()
+            .expect("valid buffer frame default"),
+        DEFAULT_BUFFER_FRAMES
+    );
+
     Command::new(env!("CARGO_PKG_NAME"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about("Split audio files into tracks")
@@ -43,6 +53,14 @@ pub fn build_cli() -> Command {
                 .value_name("POSTFIX")
                 .help("Postfix inserted into generated file names")
                 .default_value(DEFAULT_POSTFIX),
+        )
+        .arg(
+            Arg::new("buffer-frames")
+                .long("buffer-frames")
+                .value_name("FRAMES")
+                .help("Number of frames buffered in memory before flushing a segment")
+                .value_parser(value_parser!(NonZeroUsize))
+                .default_value(DEFAULT_BUFFER_FRAMES_STR),
         )
         .arg(
             Arg::new("overwrite")
