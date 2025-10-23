@@ -285,7 +285,7 @@ impl ConfigBuilder {
 }
 
 fn validate_segment_length(segment_length: Duration) -> Result<(), AudioSplitError> {
-    if segment_length.is_zero() {
+    if segment_length <= Duration::ZERO {
         Err(AudioSplitError::ZeroDuration)
     } else {
         Ok(())
@@ -1016,6 +1016,66 @@ mod tests {
             .expect("config should build");
 
         assert!(!config.allow_overwrite);
+    }
+
+    #[test]
+    fn config_builder_rejects_zero_length_before_touching_output() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+        let output_dir = temp_dir.path().join("output");
+
+        let err = Config::builder(&input_path, &output_dir, Duration::ZERO, "part")
+            .build()
+            .expect_err("expected zero duration rejection");
+
+        assert!(matches!(err, AudioSplitError::ZeroDuration));
+        assert!(
+            !output_dir.exists(),
+            "output directory should not be created when duration is invalid"
+        );
+    }
+
+    #[test]
+    fn config_builder_canonicalizes_output_with_parent_components() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let nested_dir = temp_dir.path().join("nested");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+        let input_path = nested_dir.join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let relative_output = nested_dir.join("..").join("segments");
+
+        let config = Config::builder(
+            &input_path,
+            &relative_output,
+            Duration::from_secs(1),
+            "part",
+        )
+        .build()
+        .expect("config should build");
+
+        let expected = fs::canonicalize(&relative_output).expect("canonicalize output");
+        assert_eq!(config.output_dir, expected);
+    }
+
+    #[test]
+    fn config_builder_rejects_output_paths_pointing_to_files() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_file = temp_dir.path().join("not_a_dir");
+        File::create(&output_file).expect("create file for output path");
+
+        let err = Config::builder(&input_path, &output_file, Duration::from_secs(1), "part")
+            .build()
+            .expect_err("expected invalid output path error");
+
+        match err {
+            AudioSplitError::InvalidPath(path) => assert_eq!(path, output_file),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
