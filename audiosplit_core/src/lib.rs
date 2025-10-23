@@ -9,7 +9,7 @@
 
 use std::convert::TryFrom;
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
@@ -70,6 +70,7 @@ enum Execution<'a> {
 ///
 /// ```
 /// use audiosplit_core::{AudioSplitError, Config};
+/// use std::fs;
 /// use std::time::Duration;
 /// use tempfile::tempdir;
 ///
@@ -77,6 +78,7 @@ enum Execution<'a> {
 /// let temp = tempdir()?;
 /// let missing_input = temp.path().join("missing.wav");
 /// let output_dir = temp.path().join("segments");
+/// fs::create_dir_all(&output_dir)?;
 ///
 /// match Config::new(&missing_input, &output_dir, Duration::from_secs(1), "part") {
 ///     Err(AudioSplitError::InvalidPath(path)) => assert_eq!(path, missing_input),
@@ -103,13 +105,9 @@ pub enum AudioSplitError {
     #[error("output file already exists: {0}")]
     OutputExists(PathBuf),
 
-    /// Error returned when the requested segment duration is zero.
-    #[error("segment length must be greater than zero")]
-    ZeroDuration,
-
-    /// Error returned when the requested segment duration is larger than supported.
-    #[error("segment length is too large")]
-    DurationTooLarge,
+    /// Error returned when the requested segment duration is invalid.
+    #[error("invalid segment length: {reason}")]
+    InvalidSegmentLength { reason: SegmentLengthError },
 
     /// Error returned when the number of generated segments exceeds the supported limit.
     #[error("segment limit of {limit} exceeded")]
@@ -122,6 +120,10 @@ pub enum AudioSplitError {
     /// Error returned when the container does not expose any default track.
     #[error("input stream does not provide a default track")]
     MissingDefaultTrack,
+
+    /// Error returned when the container format is not supported.
+    #[error("unsupported container format")]
+    UnsupportedFormat,
 
     /// Error returned when the codec of the track cannot be handled.
     #[error("unsupported codec")]
@@ -138,6 +140,31 @@ pub enum AudioSplitError {
     /// Error returned when the output segment exceeds the WAV size limits.
     #[error("segment is too large to be written as a WAV file")]
     SegmentTooLarge,
+
+    /// Error returned when the configured output directory cannot be found.
+    #[error("output directory does not exist: {0}")]
+    MissingOutputDirectory(PathBuf),
+
+    /// Error returned when the destination lacks sufficient free space.
+    #[error(
+        "insufficient disk space in output directory {path}: required {required} bytes, only {available} bytes available"
+    )]
+    InsufficientDiskSpace {
+        path: PathBuf,
+        required: u64,
+        available: u64,
+    },
+}
+
+/// Reasons why a segment length is considered invalid.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SegmentLengthError {
+    /// The configured segment duration was zero or negative.
+    #[error("must be greater than zero")]
+    Zero,
+    /// The segment duration exceeds representable limits.
+    #[error("is too large")]
+    TooLarge,
 }
 
 /// Configuration for the audio splitting operation.
@@ -149,7 +176,7 @@ pub enum AudioSplitError {
 ///
 /// ```
 /// use audiosplit_core::Config;
-/// use std::fs::File;
+/// use std::fs::{self, File};
 /// use std::time::Duration;
 /// use tempfile::tempdir;
 ///
@@ -158,6 +185,7 @@ pub enum AudioSplitError {
 /// let input = temp.path().join("input.wav");
 /// File::create(&input)?;
 /// let output_dir = temp.path().join("segments");
+/// fs::create_dir_all(&output_dir)?;
 ///
 /// let config = Config::new(&input, &output_dir, Duration::from_secs(1), "part")?;
 /// assert_eq!(config.segment_length, Duration::from_secs(1));
@@ -192,15 +220,17 @@ impl Config {
     /// A canonicalized [`Config`] ready for use with [`run`].
     ///
     /// # Errors
-    /// Returns [`AudioSplitError::ZeroDuration`] when `segment_length` is zero.
+    /// Returns [`AudioSplitError::InvalidSegmentLength`] when `segment_length` is zero.
     /// Returns [`AudioSplitError::InvalidPath`] when `input` is not a readable
-    /// file or `output` cannot be created as a directory.
+    /// file or `output` does not resolve to a directory.
+    /// Returns [`AudioSplitError::MissingOutputDirectory`] when the provided
+    /// output path does not exist.
     ///
     /// # Examples
     ///
     /// ```
     /// use audiosplit_core::Config;
-    /// use std::fs::File;
+    /// use std::fs::{self, File};
     /// use std::time::Duration;
     /// use tempfile::tempdir;
     ///
@@ -209,6 +239,7 @@ impl Config {
     /// let input_path = temp.path().join("input.wav");
     /// File::create(&input_path)?;
     /// let output_dir = temp.path().join("segments");
+    /// fs::create_dir_all(&output_dir)?;
     ///
     /// let config = Config::new(&input_path, &output_dir, Duration::from_millis(500), "demo")?;
     /// assert_eq!(config.postfix, "demo");
@@ -286,7 +317,9 @@ impl ConfigBuilder {
 
 fn validate_segment_length(segment_length: Duration) -> Result<(), AudioSplitError> {
     if segment_length <= Duration::ZERO {
-        Err(AudioSplitError::ZeroDuration)
+        Err(AudioSplitError::InvalidSegmentLength {
+            reason: SegmentLengthError::Zero,
+        })
     } else {
         Ok(())
     }
@@ -304,12 +337,12 @@ fn canonicalize_existing_file(path: &Path) -> Result<PathBuf, AudioSplitError> {
 }
 
 fn ensure_output_directory(path: &Path) -> Result<PathBuf, AudioSplitError> {
-    if path.exists() {
-        if !path.is_dir() {
-            return Err(AudioSplitError::InvalidPath(path.to_path_buf()));
-        }
-    } else {
-        fs::create_dir_all(path)?;
+    if !path.exists() {
+        return Err(AudioSplitError::MissingOutputDirectory(path.to_path_buf()));
+    }
+
+    if !path.is_dir() {
+        return Err(AudioSplitError::InvalidPath(path.to_path_buf()));
     }
 
     let canonical =
@@ -328,6 +361,62 @@ fn ensure_can_write_file(path: &Path, allow_overwrite: bool) -> Result<(), Audio
     }
 
     Ok(())
+}
+
+fn ensure_output_dir_present(path: &Path) -> Result<(), AudioSplitError> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(AudioSplitError::MissingOutputDirectory(path.to_path_buf()))
+    }
+}
+
+fn ensure_available_disk_space(
+    output_dir: &Path,
+    required_bytes: u64,
+) -> Result<(), AudioSplitError> {
+    if required_bytes == 0 {
+        return Ok(());
+    }
+
+    let available = query_available_space(output_dir).map_err(AudioSplitError::Io)?;
+    if available < required_bytes {
+        Err(AudioSplitError::InsufficientDiskSpace {
+            path: output_dir.to_path_buf(),
+            required: required_bytes,
+            available,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn query_available_space(path: &Path) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        let c_path = CString::new(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+        if result != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            let block_size = u128::from(stat.f_frsize);
+            let available_blocks = u128::from(stat.f_bavail);
+            let bytes = block_size.saturating_mul(available_blocks);
+            Ok(bytes.min(u128::from(u64::MAX)) as u64)
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(u64::MAX)
+    }
 }
 
 fn enforce_overwrite_rules(
@@ -394,9 +483,11 @@ fn duration_to_frames(duration: Duration, sample_rate: u64) -> Result<u64, Audio
     }
 
     let rate = u128::from(sample_rate);
-    let secs_frames = rate
-        .checked_mul(u128::from(duration.as_secs()))
-        .ok_or(AudioSplitError::DurationTooLarge)?;
+    let secs_frames = rate.checked_mul(u128::from(duration.as_secs())).ok_or(
+        AudioSplitError::InvalidSegmentLength {
+            reason: SegmentLengthError::TooLarge,
+        },
+    )?;
 
     let nanos = u128::from(duration.subsec_nanos());
     let nanos_frames = if nanos == 0 {
@@ -404,18 +495,27 @@ fn duration_to_frames(duration: Duration, sample_rate: u64) -> Result<u64, Audio
     } else {
         let scaled = rate
             .checked_mul(nanos)
-            .ok_or(AudioSplitError::DurationTooLarge)?;
+            .ok_or(AudioSplitError::InvalidSegmentLength {
+                reason: SegmentLengthError::TooLarge,
+            })?;
         scaled
             .checked_add(NANOS_PER_SECOND - 1)
-            .ok_or(AudioSplitError::DurationTooLarge)?
+            .ok_or(AudioSplitError::InvalidSegmentLength {
+                reason: SegmentLengthError::TooLarge,
+            })?
             / NANOS_PER_SECOND
     };
 
-    let total_frames = secs_frames
-        .checked_add(nanos_frames)
-        .ok_or(AudioSplitError::DurationTooLarge)?;
+    let total_frames =
+        secs_frames
+            .checked_add(nanos_frames)
+            .ok_or(AudioSplitError::InvalidSegmentLength {
+                reason: SegmentLengthError::TooLarge,
+            })?;
 
-    u64::try_from(total_frames).map_err(|_| AudioSplitError::DurationTooLarge)
+    u64::try_from(total_frames).map_err(|_| AudioSplitError::InvalidSegmentLength {
+        reason: SegmentLengthError::TooLarge,
+    })
 }
 
 fn ensure_segment_limit(
@@ -423,18 +523,25 @@ fn ensure_segment_limit(
     segment_length: Duration,
 ) -> Result<(), AudioSplitError> {
     if segment_length.is_zero() {
-        return Err(AudioSplitError::ZeroDuration);
+        return Err(AudioSplitError::InvalidSegmentLength {
+            reason: SegmentLengthError::Zero,
+        });
     }
 
     let segment_ns = segment_length.as_nanos();
     if segment_ns == 0 {
-        return Err(AudioSplitError::ZeroDuration);
+        return Err(AudioSplitError::InvalidSegmentLength {
+            reason: SegmentLengthError::Zero,
+        });
     }
 
     let total_ns = duration.as_nanos();
-    let adjusted = total_ns
-        .checked_add(segment_ns - 1)
-        .ok_or(AudioSplitError::DurationTooLarge)?;
+    let adjusted =
+        total_ns
+            .checked_add(segment_ns - 1)
+            .ok_or(AudioSplitError::InvalidSegmentLength {
+                reason: SegmentLengthError::TooLarge,
+            })?;
     let total_segments = adjusted / segment_ns;
 
     if total_segments > u128::from(MAX_SEGMENTS) {
@@ -512,6 +619,7 @@ fn ensure_segment_limit(
 /// let input_path = temp.path().join("tone.wav");
 /// write_sine_wav(&input_path)?;
 /// let output_dir = temp.path().join("segments");
+/// fs::create_dir_all(&output_dir)?;
 ///
 /// let config = Config::new(&input_path, &output_dir, Duration::from_millis(250), "part")?;
 /// run(config)?;
@@ -564,12 +672,18 @@ fn run_internal<P: ProgressReporter>(
     let file = File::open(&config.input_path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-    let probed = get_probe().format(
+    let probed = match get_probe().format(
         &hint,
         mss,
         &FormatOptions::default(),
         &MetadataOptions::default(),
-    )?;
+    ) {
+        Ok(probed) => probed,
+        Err(SymphoniaError::Unsupported(_)) => {
+            return Err(AudioSplitError::UnsupportedFormat);
+        }
+        Err(err) => return Err(AudioSplitError::from(err)),
+    };
     let mut reader = probed.format;
 
     let track = reader
@@ -585,7 +699,9 @@ fn run_internal<P: ProgressReporter>(
         .ok_or(AudioSplitError::MissingSampleRate)? as u64;
     let segment_length_frames = duration_to_frames(config.segment_length, sample_rate)?;
     if segment_length_frames == 0 {
-        return Err(AudioSplitError::ZeroDuration);
+        return Err(AudioSplitError::InvalidSegmentLength {
+            reason: SegmentLengthError::Zero,
+        });
     }
 
     let total_duration = track
@@ -598,7 +714,11 @@ fn run_internal<P: ProgressReporter>(
 
     progress.start(total_duration);
 
-    let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+    let mut decoder = match get_codecs().make(&track.codec_params, &DecoderOptions::default()) {
+        Ok(decoder) => decoder,
+        Err(SymphoniaError::Unsupported(_)) => return Err(AudioSplitError::UnsupportedCodec),
+        Err(err) => return Err(AudioSplitError::from(err)),
+    };
 
     let mut frames_in_segment: u64 = 0;
     let mut segment_index: u64 = 0;
@@ -662,15 +782,16 @@ fn run_internal<P: ProgressReporter>(
                         }
                         segment_index += 1;
                         pad_width = pad_width.max(num_width(segment_index));
-                        writer = create_writer(
-                            &config,
+                        let writer_params = WriterParams {
+                            config: &config,
                             base_name,
                             extension,
                             pad_width,
                             segment_index,
-                            &spec,
-                            execution,
-                        )?;
+                            signal_spec: spec,
+                            segment_length_frames,
+                        };
+                        writer = create_writer(&writer_params, execution)?;
                     }
 
                     let remaining_in_segment =
@@ -724,37 +845,56 @@ fn num_width(mut value: u64) -> usize {
     width
 }
 
-fn create_writer(
-    config: &Config,
-    base_name: &str,
-    extension: &str,
+struct WriterParams<'a> {
+    config: &'a Config,
+    base_name: &'a str,
+    extension: &'a str,
     pad_width: usize,
     segment_index: u64,
-    signal_spec: &SignalSpec,
+    signal_spec: SignalSpec,
+    segment_length_frames: u64,
+}
+
+fn create_writer(
+    params: &WriterParams,
     execution: &mut Execution,
 ) -> Result<Option<SegmentWriter>, AudioSplitError> {
+    let padded_index = format!("{:0width$}", params.segment_index, width = params.pad_width);
     let file_name = format!(
-        "{}_{}_{}.{extension}",
-        base_name,
-        config.postfix,
-        format_args!("{segment_index:0pad_width$}")
+        "{}_{}_{}.{}",
+        params.base_name, params.config.postfix, padded_index, params.extension
     );
 
-    let mut output_path = config.output_dir.clone();
+    let mut output_path = params.config.output_dir.clone();
     output_path.push(file_name);
 
-    if !output_path.starts_with(&config.output_dir) {
+    if !output_path.starts_with(&params.config.output_dir) {
         return Err(AudioSplitError::InvalidPath(output_path));
     }
 
-    ensure_can_write_file(&output_path, config.allow_overwrite)?;
+    ensure_output_dir_present(&params.config.output_dir)?;
+    ensure_can_write_file(&output_path, params.config.allow_overwrite)?;
 
     match execution {
         Execution::Write => {
-            let channels = u16::try_from(signal_spec.channels.count())
+            let channel_count = params.signal_spec.channels.count();
+            let channels = u16::try_from(channel_count)
                 .map_err(|_| AudioSplitError::UnsupportedChannelLayout)?;
 
-            SegmentWriter::create(output_path, signal_spec.rate, channels).map(Some)
+            let bytes_per_frame = channel_count
+                .checked_mul(2)
+                .ok_or(AudioSplitError::UnsupportedChannelLayout)?
+                as u64;
+            let required_bytes = params
+                .segment_length_frames
+                .checked_mul(bytes_per_frame)
+                .ok_or(AudioSplitError::InvalidSegmentLength {
+                    reason: SegmentLengthError::TooLarge,
+                })?;
+
+            ensure_available_disk_space(&params.config.output_dir, required_bytes)?;
+
+            SegmentWriter::create(output_path, params.signal_spec.rate, channels).map(Some)
         }
         Execution::DryRun(recorder) => {
             recorder.record(&output_path);
@@ -945,7 +1085,12 @@ mod tests {
         let err = Config::new(&input_path, temp_dir.path(), Duration::ZERO, "part")
             .expect_err("expected zero duration rejection");
 
-        assert!(matches!(err, AudioSplitError::ZeroDuration));
+        match err {
+            AudioSplitError::InvalidSegmentLength { reason } => {
+                assert_eq!(reason, SegmentLengthError::Zero);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -994,6 +1139,7 @@ mod tests {
         File::create(&input_path).expect("create input file");
 
         let output_dir = nested_dir.join("output");
+        fs::create_dir_all(&output_dir).expect("create output directory");
 
         let config = Config::new(&input_path, &output_dir, Duration::from_millis(500), "demo")
             .expect("config should be constructed");
@@ -1010,6 +1156,7 @@ mod tests {
         let input_path = temp_dir.path().join("input.wav");
         File::create(&input_path).expect("create input file");
         let output_dir = temp_dir.path().join("output");
+        fs::create_dir_all(&output_dir).expect("create output directory");
 
         let config = Config::builder(&input_path, &output_dir, Duration::from_secs(1), "part")
             .build()
@@ -1029,7 +1176,12 @@ mod tests {
             .build()
             .expect_err("expected zero duration rejection");
 
-        assert!(matches!(err, AudioSplitError::ZeroDuration));
+        match err {
+            AudioSplitError::InvalidSegmentLength { reason } => {
+                assert_eq!(reason, SegmentLengthError::Zero);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
         assert!(
             !output_dir.exists(),
             "output directory should not be created when duration is invalid"
@@ -1045,6 +1197,7 @@ mod tests {
         File::create(&input_path).expect("create input file");
 
         let relative_output = nested_dir.join("..").join("segments");
+        fs::create_dir_all(&relative_output).expect("create output directory");
 
         let config = Config::builder(
             &input_path,
@@ -1121,12 +1274,27 @@ mod tests {
     }
 
     #[test]
-    fn ensure_output_directory_creates_and_canonicalizes() {
+    fn ensure_output_directory_rejects_missing_paths() {
         let temp_dir = tempdir().expect("create temp dir");
         let nested_output = temp_dir.path().join("nested/output");
 
+        let err = ensure_output_directory(&nested_output)
+            .expect_err("missing directory should be rejected");
+
+        match err {
+            AudioSplitError::MissingOutputDirectory(path) => assert_eq!(path, nested_output),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_output_directory_canonicalizes_existing_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let nested_output = temp_dir.path().join("nested/output");
+        fs::create_dir_all(&nested_output).expect("create nested output dir");
+
         let canonical =
-            ensure_output_directory(&nested_output).expect("directory should be created");
+            ensure_output_directory(&nested_output).expect("directory should be accepted");
 
         assert!(canonical.is_dir());
         assert!(canonical.is_absolute());
@@ -1143,6 +1311,27 @@ mod tests {
 
         match err {
             AudioSplitError::InvalidPath(path) => assert_eq!(path, file_path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_available_disk_space_detects_insufficient_capacity() {
+        let temp_dir = tempdir().expect("create temp dir");
+
+        let err = ensure_available_disk_space(temp_dir.path(), u64::MAX)
+            .expect_err("available space check should fail for unrealistic requirement");
+
+        match err {
+            AudioSplitError::InsufficientDiskSpace {
+                path,
+                required,
+                available,
+            } => {
+                assert_eq!(path, temp_dir.path());
+                assert_eq!(required, u64::MAX);
+                assert!(available < required);
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }

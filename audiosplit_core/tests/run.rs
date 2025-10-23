@@ -88,6 +88,59 @@ fn run_splits_audio_and_keeps_remainder_segment() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
+fn run_reports_unsupported_format_for_unknown_input() -> Result<(), Box<dyn Error>> {
+    let work_dir = tempdir()?;
+    let input_path = work_dir.path().join("input.bin");
+    File::create(&input_path)?.write_all(b"not an audio file")?;
+
+    let output_dir = tempdir()?;
+    let config = Config::new(
+        &input_path,
+        output_dir.path(),
+        Duration::from_secs(1),
+        "part",
+    )?;
+
+    let err = run(config).expect_err("unsupported input should fail");
+    assert!(matches!(err, AudioSplitError::UnsupportedFormat));
+
+    output_dir.close()?;
+    work_dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn run_detects_missing_output_directory() -> Result<(), Box<dyn Error>> {
+    let work_dir = tempdir()?;
+    let input_path = work_dir.path().join("tone.wav");
+    write_test_tone(&input_path, 8_000, 500)?;
+
+    let output_dir = tempdir()?;
+    let output_path = output_dir.path().to_path_buf();
+    let config = Config::new(
+        &input_path,
+        &output_path,
+        Duration::from_millis(250),
+        "part",
+    )?;
+
+    // Remove the directory after configuration has been created to simulate external deletion.
+    drop(output_dir);
+    assert!(!output_path.exists());
+
+    let err = run(config).expect_err("missing output directory should be reported");
+    match err {
+        AudioSplitError::MissingOutputDirectory(path) => {
+            assert_eq!(path, output_path);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    work_dir.close()?;
+    Ok(())
+}
+
+#[test]
 fn run_enforces_segment_limit() -> Result<(), Box<dyn Error>> {
     let work_dir = tempdir()?;
     let input_path = work_dir.path().join("long.wav");
