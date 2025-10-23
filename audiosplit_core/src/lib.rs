@@ -907,7 +907,6 @@ enum SegmentDispatchStrategy {
 
 struct ThreadPoolDispatcher {
     sender: Mutex<Option<mpsc::Sender<SegmentEncodeJob>>>,
-    receiver: Arc<Mutex<mpsc::Receiver<SegmentEncodeJob>>>,
     error_receiver: mpsc::Receiver<AudioSplitError>,
     handles: Vec<std::thread::JoinHandle<()>>,
 }
@@ -946,7 +945,6 @@ impl ThreadPoolDispatcher {
 
         Self {
             sender: Mutex::new(Some(job_sender)),
-            receiver: job_receiver,
             error_receiver,
             handles,
         }
@@ -1078,12 +1076,15 @@ fn run_internal<P: ProgressReporter>(
         })
         .unwrap_or(1);
     let dispatcher = SegmentDispatcher::new(config.threads);
-    let splitter = StreamingSplitter::new(
-        execution,
-        &config,
+    let naming = SegmentNaming {
         base_name,
         extension,
         pad_width,
+    };
+    let splitter = StreamingSplitter::new(
+        execution,
+        &config,
+        naming,
         segment_length_frames,
         sample_rate,
         dispatcher,
@@ -1099,12 +1100,16 @@ fn run_internal<P: ProgressReporter>(
     Ok(metrics)
 }
 
-struct StreamingSplitter<'exec, 'recorder, 'cfg> {
-    execution: &'exec mut Execution<'recorder>,
-    config: &'cfg Config,
+struct SegmentNaming {
     base_name: String,
     extension: String,
     pad_width: usize,
+}
+
+struct StreamingSplitter<'exec, 'recorder, 'cfg> {
+    execution: &'exec mut Execution<'recorder>,
+    config: &'cfg Config,
+    naming: SegmentNaming,
     segment_length_frames: u64,
     sample_rate: u64,
     buffer_size_frames: usize,
@@ -1124,9 +1129,7 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
     fn new(
         execution: &'exec mut Execution<'recorder>,
         config: &'cfg Config,
-        base_name: String,
-        extension: String,
-        pad_width: usize,
+        naming: SegmentNaming,
         segment_length_frames: u64,
         sample_rate: u64,
         dispatcher: SegmentDispatcher,
@@ -1134,9 +1137,7 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         Self {
             execution,
             config,
-            base_name,
-            extension,
-            pad_width,
+            naming,
             segment_length_frames,
             sample_rate,
             buffer_size_frames: config.buffer_size_frames.get(),
@@ -1340,13 +1341,13 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
 
         self.segment_index += 1;
         self.segments_created += 1;
-        self.pad_width = self.pad_width.max(num_width(self.segment_index));
+        self.naming.pad_width = self.naming.pad_width.max(num_width(self.segment_index));
 
         let writer_params = WriterParams {
             config: self.config,
-            base_name: &self.base_name,
-            extension: &self.extension,
-            pad_width: self.pad_width,
+            base_name: &self.naming.base_name,
+            extension: &self.naming.extension,
+            pad_width: self.naming.pad_width,
             segment_index: self.segment_index,
             signal_spec: spec,
             segment_length_frames: self.segment_length_frames,
