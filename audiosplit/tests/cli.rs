@@ -260,9 +260,9 @@ fn cli_dry_run_outputs_plan_without_writing_files() -> Result<(), Box<dyn Error>
     assert_eq!(
         entries,
         vec![
-            "  - input_part_1.wav",
-            "  - input_part_2.wav",
-            "  - input_part_3.wav"
+            "  - input_part_0001.wav",
+            "  - input_part_0002.wav",
+            "  - input_part_0003.wav"
         ],
         "dry-run output should list each segment on its own line"
     );
