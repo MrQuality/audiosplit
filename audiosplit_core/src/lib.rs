@@ -1020,8 +1020,8 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             self.work_buffer.clear();
 
             for frame in frame_index..frame_index + frames_to_take {
-                for channel in 0..channel_count {
-                    let sample = channel_slices[channel][frame];
+                for channel_slice in &channel_slices {
+                    let sample = channel_slice[frame];
                     self.work_buffer.push(i16::from_sample(sample));
                 }
             }
