@@ -1,4 +1,5 @@
 use clap::{builder::ValueParser, value_parser, Arg, ArgAction, Command};
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 mod duration;
@@ -33,7 +34,7 @@ pub fn build_cli() -> Command {
                 .long("output")
                 .value_name("OUTPUT_DIR")
                 .help("Directory where the split tracks will be written")
-                .default_value(".")
+                .default_value_os(OsStr::new("."))
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
