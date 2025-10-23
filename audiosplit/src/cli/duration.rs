@@ -375,7 +375,7 @@ impl Unit {
     fn max_scale(self) -> u32 {
         let mut value = self.nanos();
         let mut zeros = 0u32;
-        while value % 10 == 0 {
+        while value.is_multiple_of(10) {
             value /= 10;
             zeros += 1;
         }
