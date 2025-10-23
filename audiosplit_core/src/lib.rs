@@ -26,6 +26,44 @@ use thiserror::Error;
 const MAX_SEGMENTS: u64 = 50_000;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
+/// Trait used to relay progress information while splitting audio files.
+pub trait ProgressReporter {
+    /// Called before processing begins. Provides the total duration when known.
+    fn start(&mut self, _total_duration: Option<Duration>) {}
+
+    /// Called after progress is made, providing the processed duration so far.
+    fn update(&mut self, _processed: Duration) {}
+
+    /// Called once the splitting completes or the operation terminates.
+    fn finish(&mut self) {}
+}
+
+/// Trait used during dry-run simulations to capture planned segment paths.
+pub trait DryRunRecorder {
+    /// Record a prospective output path.
+    fn record(&mut self, _path: &Path) {}
+}
+
+struct NoProgressReporter;
+
+impl ProgressReporter for NoProgressReporter {}
+
+#[derive(Default)]
+struct CollectingDryRunRecorder {
+    segments: Vec<PathBuf>,
+}
+
+impl DryRunRecorder for CollectingDryRunRecorder {
+    fn record(&mut self, path: &Path) {
+        self.segments.push(path.to_path_buf());
+    }
+}
+
+enum Execution<'a> {
+    Write,
+    DryRun(&'a mut dyn DryRunRecorder),
+}
+
 /// Errors that can occur while splitting audio files.
 ///
 /// # Examples
@@ -488,6 +526,36 @@ fn ensure_segment_limit(
 /// # }
 /// ```
 pub fn run(config: Config) -> Result<(), AudioSplitError> {
+    let mut progress = NoProgressReporter;
+    let mut execution = Execution::Write;
+    run_internal(config, &mut execution, &mut progress)
+}
+
+/// Execute the split operation while reporting progress to the provided reporter.
+pub fn run_with_progress<P: ProgressReporter>(
+    config: Config,
+    progress: &mut P,
+) -> Result<(), AudioSplitError> {
+    let mut execution = Execution::Write;
+    run_internal(config, &mut execution, progress)
+}
+
+/// Perform a dry-run of the split operation, returning the planned segment paths.
+pub fn dry_run(config: Config) -> Result<Vec<PathBuf>, AudioSplitError> {
+    let mut recorder = CollectingDryRunRecorder::default();
+    {
+        let mut execution = Execution::DryRun(&mut recorder);
+        let mut progress = NoProgressReporter;
+        run_internal(config, &mut execution, &mut progress)?;
+    }
+    Ok(recorder.segments)
+}
+
+fn run_internal<P: ProgressReporter>(
+    config: Config,
+    execution: &mut Execution,
+    progress: &mut P,
+) -> Result<(), AudioSplitError> {
     let mut hint = Hint::new();
     if let Some(extension) = config.input_path.extension().and_then(|ext| ext.to_str()) {
         hint.with_extension(extension);
@@ -520,10 +588,15 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
         return Err(AudioSplitError::ZeroDuration);
     }
 
-    if let Some(total_frames) = track.codec_params.n_frames {
-        let duration = frames_to_duration(total_frames, sample_rate);
+    let total_duration = track
+        .codec_params
+        .n_frames
+        .map(|total_frames| frames_to_duration(total_frames, sample_rate));
+    if let Some(duration) = total_duration {
         ensure_segment_limit(duration, config.segment_length)?;
     }
+
+    progress.start(total_duration);
 
     let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
@@ -589,14 +662,15 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
                         }
                         segment_index += 1;
                         pad_width = pad_width.max(num_width(segment_index));
-                        writer = Some(create_writer(
+                        writer = create_writer(
                             &config,
                             base_name,
                             extension,
                             pad_width,
                             segment_index,
                             &spec,
-                        )?);
+                            execution,
+                        )?;
                     }
 
                     let remaining_in_segment =
@@ -622,12 +696,17 @@ pub fn run(config: Config) -> Result<(), AudioSplitError> {
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(err) => return Err(AudioSplitError::from(err)),
         }
+
+        let processed_duration = frames_to_duration(total_frames_processed, sample_rate);
+        progress.update(processed_duration);
     }
 
     finalize_writer(&mut writer)?;
 
     let duration = frames_to_duration(total_frames_processed, sample_rate);
     ensure_segment_limit(duration, config.segment_length)?;
+
+    progress.finish();
 
     Ok(())
 }
@@ -652,7 +731,8 @@ fn create_writer(
     pad_width: usize,
     segment_index: u64,
     signal_spec: &SignalSpec,
-) -> Result<SegmentWriter, AudioSplitError> {
+    execution: &mut Execution,
+) -> Result<Option<SegmentWriter>, AudioSplitError> {
     let file_name = format!(
         "{}_{}_{}.{extension}",
         base_name,
@@ -669,10 +749,18 @@ fn create_writer(
 
     ensure_can_write_file(&output_path, config.allow_overwrite)?;
 
-    let channels = u16::try_from(signal_spec.channels.count())
-        .map_err(|_| AudioSplitError::UnsupportedChannelLayout)?;
+    match execution {
+        Execution::Write => {
+            let channels = u16::try_from(signal_spec.channels.count())
+                .map_err(|_| AudioSplitError::UnsupportedChannelLayout)?;
 
-    SegmentWriter::create(output_path, signal_spec.rate, channels)
+            SegmentWriter::create(output_path, signal_spec.rate, channels).map(Some)
+        }
+        Execution::DryRun(recorder) => {
+            recorder.record(&output_path);
+            Ok(Some(SegmentWriter::dry()))
+        }
+    }
 }
 
 fn finalize_writer(writer: &mut Option<SegmentWriter>) -> Result<(), AudioSplitError> {
@@ -682,12 +770,45 @@ fn finalize_writer(writer: &mut Option<SegmentWriter>) -> Result<(), AudioSplitE
     Ok(())
 }
 
-struct SegmentWriter {
+enum SegmentWriter {
+    Real(RealSegmentWriter),
+    Dry,
+}
+
+impl SegmentWriter {
+    fn create<P: AsRef<Path>>(
+        path: P,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Self, AudioSplitError> {
+        RealSegmentWriter::create(path, sample_rate, channels).map(SegmentWriter::Real)
+    }
+
+    fn dry() -> Self {
+        SegmentWriter::Dry
+    }
+
+    fn write_samples(&mut self, samples: &[i16]) -> Result<(), AudioSplitError> {
+        match self {
+            SegmentWriter::Real(real) => real.write_samples(samples),
+            SegmentWriter::Dry => Ok(()),
+        }
+    }
+
+    fn finalize(self) -> Result<(), AudioSplitError> {
+        match self {
+            SegmentWriter::Real(real) => real.finalize(),
+            SegmentWriter::Dry => Ok(()),
+        }
+    }
+}
+
+struct RealSegmentWriter {
     file: File,
     data_bytes: u64,
 }
 
-impl SegmentWriter {
+impl RealSegmentWriter {
     fn create<P: AsRef<Path>>(
         path: P,
         sample_rate: u32,

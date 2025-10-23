@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "audiosplit",
-    "audiosplit_core"
+    "audiosplit_core",
+    "indicatif"
 ]
 resolver = "2"
 

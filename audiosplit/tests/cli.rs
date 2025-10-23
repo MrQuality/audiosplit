@@ -99,3 +99,34 @@ fn cli_reports_missing_input_file() -> Result<(), Box<dyn Error>> {
     output_dir.close()?;
     Ok(())
 }
+
+#[test]
+fn cli_dry_run_outputs_plan_without_writing_files() -> Result<(), Box<dyn Error>> {
+    let input_dir = tempdir()?;
+    let input_path = input_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 1_100)?;
+
+    let output_dir = tempdir()?;
+    let output_arg = output_dir.path().to_string_lossy().to_string();
+    let input_arg = input_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("audiosplit")?;
+    let assert = cmd
+        .args(["--length", "400ms", "--output"])
+        .arg(&output_arg)
+        .arg(&input_arg)
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.stdout().to_vec())?;
+    assert!(stdout.contains("Dry run - planned segments:"));
+    assert!(stdout.contains("input_part_1.wav"));
+
+    let produced: Vec<_> = fs::read_dir(output_dir.path())?.collect();
+    assert!(produced.is_empty(), "dry-run should not write output files");
+
+    output_dir.close()?;
+    input_dir.close()?;
+    Ok(())
+}
