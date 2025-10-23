@@ -94,9 +94,35 @@ fn cli_reports_missing_input_file() -> Result<(), Box<dyn Error>> {
         .arg("missing.wav");
     cmd.assert()
         .failure()
-        .stderr_contains("input file does not exist");
+        .stderr_contains("invalid path: missing.wav");
 
     output_dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn cli_creates_missing_output_directory_when_allowed() -> Result<(), Box<dyn Error>> {
+    let input_dir = tempdir()?;
+    let input_path = input_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 1_100)?;
+
+    let base_dir = tempdir()?;
+    let output_dir = base_dir.path().join("segments");
+    assert!(
+        !output_dir.exists(),
+        "output directory should be created by the CLI"
+    );
+
+    let mut cmd = Command::cargo_bin("audiosplit")?;
+    cmd.args(["--length", "400ms", "--output"])
+        .arg(output_dir.to_string_lossy().to_string())
+        .arg(input_path.to_string_lossy().to_string());
+    cmd.assert().success();
+
+    assert!(output_dir.exists(), "CLI should create output directory");
+
+    base_dir.close()?;
+    input_dir.close()?;
     Ok(())
 }
 

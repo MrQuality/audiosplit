@@ -4,7 +4,7 @@ use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use audiosplit_core::{Config, ProgressReporter};
 use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
 
@@ -106,13 +106,6 @@ fn main() -> anyhow::Result<()> {
     let input_path = matches
         .get_one::<PathBuf>("file_path")
         .expect("required argument");
-    if !input_path.is_file() {
-        return Err(anyhow!(
-            "input file does not exist: {}",
-            input_path.display()
-        ));
-    }
-
     let segment_length = *matches
         .get_one::<Duration>("length")
         .expect("required argument");
@@ -127,6 +120,7 @@ fn main() -> anyhow::Result<()> {
     let dry_run = matches.get_flag("dry-run");
 
     let config = Config::builder(input_path, output_dir, segment_length, postfix)
+        .create_output_dir(true)
         .overwrite(overwrite)
         .build()
         .with_context(|| {

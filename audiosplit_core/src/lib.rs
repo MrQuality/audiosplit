@@ -8,10 +8,11 @@
 //! callers to recover from issues such as unsupported codecs or invalid paths.
 
 use std::convert::TryFrom;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -273,6 +274,7 @@ pub struct ConfigBuilder {
     segment_length: Duration,
     postfix: String,
     overwrite: bool,
+    create_output_dir: bool,
 }
 
 impl ConfigBuilder {
@@ -289,6 +291,7 @@ impl ConfigBuilder {
             segment_length,
             postfix: postfix.into(),
             overwrite: false,
+            create_output_dir: false,
         }
     }
 
@@ -298,11 +301,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Allow or forbid creating the output directory when it does not exist.
+    pub fn create_output_dir(mut self, allow: bool) -> Self {
+        self.create_output_dir = allow;
+        self
+    }
+
     /// Finalize the builder, validating paths and constructing the [`Config`].
     pub fn build(self) -> Result<Config, AudioSplitError> {
         validate_segment_length(self.segment_length)?;
         let input_path = canonicalize_existing_file(&self.input)?;
-        let output_dir = ensure_output_directory(&self.output)?;
+        let output_dir = prepare_output_directory(&self.output, self.create_output_dir)?;
+        check_write_permission(&output_dir)?;
         enforce_overwrite_rules(&output_dir, &input_path, &self.postfix, self.overwrite)?;
 
         Ok(Config {
@@ -355,12 +365,67 @@ fn ensure_output_directory(path: &Path) -> Result<PathBuf, AudioSplitError> {
     }
 }
 
+fn prepare_output_directory(path: &Path, create: bool) -> Result<PathBuf, AudioSplitError> {
+    if !path.exists() {
+        if create {
+            fs::create_dir_all(path).map_err(AudioSplitError::Io)?;
+        } else {
+            return Err(AudioSplitError::MissingOutputDirectory(path.to_path_buf()));
+        }
+    }
+
+    ensure_output_directory(path)
+}
+
 fn ensure_can_write_file(path: &Path, allow_overwrite: bool) -> Result<(), AudioSplitError> {
     if !allow_overwrite && path.exists() {
         return Err(AudioSplitError::OutputExists(path.to_path_buf()));
     }
 
     Ok(())
+}
+
+fn check_write_permission(path: &Path) -> Result<(), AudioSplitError> {
+    const MAX_ATTEMPTS: u32 = 5;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let candidate = path.join(format!(
+            ".audiosplit_write_test_{}_{}_{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|_| Duration::ZERO)
+                .as_nanos(),
+            attempt
+        ));
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                drop(file);
+                match fs::remove_file(&candidate) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(AudioSplitError::Io(err)),
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if attempt + 1 == MAX_ATTEMPTS {
+                    return Err(AudioSplitError::Io(err));
+                }
+            }
+            Err(err) => return Err(AudioSplitError::Io(err)),
+        }
+    }
+
+    Err(AudioSplitError::Io(io::Error::new(
+        io::ErrorKind::Other,
+        "failed to create temporary file for permission check",
+    )))
 }
 
 fn ensure_output_dir_present(path: &Path) -> Result<(), AudioSplitError> {
@@ -1274,6 +1339,54 @@ mod tests {
     }
 
     #[test]
+    fn config_builder_creates_output_directory_when_allowed() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = temp_dir.path().join("segments/nested");
+        assert!(
+            !output_dir.exists(),
+            "output directory should start missing"
+        );
+
+        let config = Config::builder(&input_path, &output_dir, Duration::from_secs(1), "part")
+            .create_output_dir(true)
+            .build()
+            .expect("builder should create missing directory");
+
+        assert!(
+            output_dir.exists(),
+            "builder should create directory when allowed"
+        );
+        assert!(config.output_dir.is_dir());
+    }
+
+    #[test]
+    fn config_builder_rejects_zero_length_before_creating_output() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+        let output_dir = temp_dir.path().join("segments");
+
+        let err = Config::builder(&input_path, &output_dir, Duration::ZERO, "part")
+            .create_output_dir(true)
+            .build()
+            .expect_err("expected zero duration rejection");
+
+        match err {
+            AudioSplitError::InvalidSegmentLength { reason } => {
+                assert_eq!(reason, SegmentLengthError::Zero);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            !output_dir.exists(),
+            "output directory should not be created when duration is invalid"
+        );
+    }
+
+    #[test]
     fn ensure_output_directory_rejects_missing_paths() {
         let temp_dir = tempdir().expect("create temp dir");
         let nested_output = temp_dir.path().join("nested/output");
@@ -1313,6 +1426,47 @@ mod tests {
             AudioSplitError::InvalidPath(path) => assert_eq!(path, file_path),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_write_permission_accepts_writable_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+        check_write_permission(temp_dir.path()).expect("temporary directory should be writable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_write_permission_rejects_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping read-only directory permission check for root user");
+            return;
+        }
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let output_dir = temp_dir.path().join("readonly");
+        fs::create_dir_all(&output_dir).expect("create readonly dir");
+
+        let metadata = fs::metadata(&output_dir).expect("read metadata");
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&output_dir, perms).expect("set read-only permissions");
+
+        let err = check_write_permission(&output_dir)
+            .expect_err("read-only directory should be rejected");
+
+        if let AudioSplitError::Io(io_err) = err {
+            assert_eq!(io_err.kind(), io::ErrorKind::PermissionDenied);
+        } else {
+            panic!("unexpected error variant: {err:?}");
+        }
+
+        let mut perms = fs::metadata(&output_dir)
+            .expect("refresh metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&output_dir, perms).expect("restore permissions");
     }
 
     #[test]
