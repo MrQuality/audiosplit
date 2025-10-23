@@ -32,10 +32,14 @@ fn main() {
             .get_one::<NonZeroUsize>("buffer-frames")
             .expect("defaulted argument");
         let overwrite = matches.get_flag("overwrite");
+        let write_buffer_samples = *matches
+            .get_one::<NonZeroUsize>("write-buffer-samples")
+            .expect("defaulted argument");
         let dry_run = matches.get_flag("dry-run");
 
         let config = Config::builder(input_path, output_dir, segment_length, postfix)
             .buffer_size_frames(buffer_frames)
+            .write_buffer_samples(write_buffer_samples)
             .create_output_dir(true)
             .overwrite(overwrite)
             .build()

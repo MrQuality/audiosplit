@@ -28,7 +28,14 @@ use thiserror::Error;
 
 /// Maximum number of segments produced from a single input file.
 const MAX_SEGMENTS: u64 = 50_000;
-pub const DEFAULT_BUFFER_FRAMES: usize = 4_096;
+/// Default number of frames pulled from the decoder in a single chunk.
+pub const OPTIMAL_DECODE_BUFFER_FRAMES: usize = 4_096;
+/// Default number of interleaved samples written to disk in a single chunk.
+pub const OPTIMAL_WRITE_BUFFER_SAMPLES: usize = OPTIMAL_DECODE_BUFFER_FRAMES * 2;
+/// Backwards-compatible alias for the previous constant name used by the CLI.
+pub const DEFAULT_BUFFER_FRAMES: usize = OPTIMAL_DECODE_BUFFER_FRAMES;
+/// Backwards-compatible alias for consumers expecting the write buffer constant.
+pub const DEFAULT_WRITE_BUFFER_SAMPLES: usize = OPTIMAL_WRITE_BUFFER_SAMPLES;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// Trait used to relay progress information while splitting audio files.
@@ -167,6 +174,10 @@ pub enum AudioSplitError {
         required: u64,
         available: u64,
     },
+
+    /// Error returned when the configured write buffer cannot hold even a single frame.
+    #[error("write buffer of {requested} samples cannot accommodate {channels} audio channels")]
+    WriteBufferTooSmall { requested: usize, channels: usize },
 }
 
 /// Reasons why a segment length is considered invalid.
@@ -220,6 +231,8 @@ pub struct Config {
     pub allow_overwrite: bool,
     /// Maximum number of frames buffered in memory before flushing to disk.
     pub buffer_size_frames: NonZeroUsize,
+    /// Maximum number of interleaved samples buffered before writing to disk.
+    pub write_buffer_samples: NonZeroUsize,
 }
 
 impl Config {
@@ -290,6 +303,7 @@ pub struct ConfigBuilder {
     overwrite: bool,
     create_output_dir: bool,
     buffer_size_frames: NonZeroUsize,
+    write_buffer_samples: NonZeroUsize,
 }
 
 impl ConfigBuilder {
@@ -309,6 +323,8 @@ impl ConfigBuilder {
             create_output_dir: false,
             buffer_size_frames: NonZeroUsize::new(DEFAULT_BUFFER_FRAMES)
                 .expect("default buffer size must be non-zero"),
+            write_buffer_samples: NonZeroUsize::new(DEFAULT_WRITE_BUFFER_SAMPLES)
+                .expect("default write buffer size must be non-zero"),
         }
     }
 
@@ -330,6 +346,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Configure the number of interleaved samples buffered before writing to disk.
+    pub fn write_buffer_samples(mut self, samples: NonZeroUsize) -> Self {
+        self.write_buffer_samples = samples;
+        self
+    }
+
     /// Finalize the builder, validating paths and constructing the [`Config`].
     pub fn build(self) -> Result<Config, AudioSplitError> {
         validate_segment_length(self.segment_length)?;
@@ -345,6 +367,7 @@ impl ConfigBuilder {
             postfix: self.postfix,
             allow_overwrite: self.overwrite,
             buffer_size_frames: self.buffer_size_frames,
+            write_buffer_samples: self.write_buffer_samples,
         })
     }
 }
@@ -895,6 +918,7 @@ struct StreamingSplitter<'exec, 'recorder, 'cfg> {
     segment_length_frames: u64,
     sample_rate: u64,
     buffer_size_frames: usize,
+    write_buffer_samples: usize,
     frames_in_segment: u64,
     segment_index: u64,
     total_frames_processed: u64,
@@ -924,11 +948,12 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             segment_length_frames,
             sample_rate,
             buffer_size_frames: config.buffer_size_frames.get(),
+            write_buffer_samples: config.write_buffer_samples.get(),
             frames_in_segment: 0,
             segment_index: 0,
             total_frames_processed: 0,
             writer: None,
-            work_buffer: Vec::with_capacity(config.buffer_size_frames.get()),
+            work_buffer: Vec::with_capacity(config.write_buffer_samples.get()),
             peak_frames_per_chunk: 0,
             peak_samples_per_chunk: 0,
             segments_created: 0,
@@ -994,6 +1019,13 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             return Ok(());
         }
 
+        if self.write_buffer_samples < channel_count {
+            return Err(AudioSplitError::WriteBufferTooSmall {
+                requested: self.write_buffer_samples,
+                channels: channel_count,
+            });
+        }
+
         let total_frames = buffer.frames();
         if total_frames == 0 {
             return Ok(());
@@ -1005,10 +1037,13 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         }
 
         let mut frame_index = 0;
+        let frames_per_write_chunk = self.write_buffer_samples / channel_count;
+        let frames_per_write_chunk = frames_per_write_chunk.max(1);
         while frame_index < total_frames {
             let frames_to_take = self
                 .buffer_size_frames
-                .min(total_frames.saturating_sub(frame_index));
+                .min(total_frames.saturating_sub(frame_index))
+                .min(frames_per_write_chunk);
             let frames_to_take = frames_to_take.max(1);
             self.peak_frames_per_chunk = self.peak_frames_per_chunk.max(frames_to_take);
 

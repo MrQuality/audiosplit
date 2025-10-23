@@ -1,4 +1,4 @@
-use audiosplit_core::DEFAULT_BUFFER_FRAMES;
+use audiosplit_core::{DEFAULT_BUFFER_FRAMES, DEFAULT_WRITE_BUFFER_SAMPLES};
 use clap::{builder::ValueParser, value_parser, Arg, ArgAction, Command};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ const LENGTH_HELP: &str = concat!(
 
 pub const DEFAULT_POSTFIX: &str = "part";
 const DEFAULT_BUFFER_FRAMES_STR: &str = "4096";
+const DEFAULT_WRITE_BUFFER_SAMPLES_STR: &str = "8192";
 
 pub fn build_cli() -> Command {
     debug_assert_eq!(
@@ -22,6 +23,12 @@ pub fn build_cli() -> Command {
             .parse::<usize>()
             .expect("valid buffer frame default"),
         DEFAULT_BUFFER_FRAMES
+    );
+    debug_assert_eq!(
+        DEFAULT_WRITE_BUFFER_SAMPLES_STR
+            .parse::<usize>()
+            .expect("valid write buffer default"),
+        DEFAULT_WRITE_BUFFER_SAMPLES
     );
 
     Command::new(env!("CARGO_PKG_NAME"))
@@ -61,6 +68,14 @@ pub fn build_cli() -> Command {
                 .help("Number of frames buffered in memory before flushing a segment")
                 .value_parser(value_parser!(NonZeroUsize))
                 .default_value(DEFAULT_BUFFER_FRAMES_STR),
+        )
+        .arg(
+            Arg::new("write-buffer-samples")
+                .long("write-buffer-samples")
+                .value_name("SAMPLES")
+                .help("Number of interleaved samples buffered before writing to disk")
+                .value_parser(value_parser!(NonZeroUsize))
+                .default_value(DEFAULT_WRITE_BUFFER_SAMPLES_STR),
         )
         .arg(
             Arg::new("overwrite")
