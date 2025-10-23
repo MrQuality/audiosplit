@@ -394,7 +394,7 @@ fn check_write_permission(path: &Path) -> Result<(), AudioSplitError> {
             process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|_| Duration::ZERO)
+                .unwrap_or(Duration::ZERO)
                 .as_nanos(),
             attempt
         ));
@@ -422,8 +422,7 @@ fn check_write_permission(path: &Path) -> Result<(), AudioSplitError> {
         }
     }
 
-    Err(AudioSplitError::Io(io::Error::new(
-        io::ErrorKind::Other,
+    Err(AudioSplitError::Io(io::Error::other(
         "failed to create temporary file for permission check",
     )))
 }
