@@ -14,6 +14,7 @@ struct CliProgress {
     bar: ProgressBar,
     total: Option<u64>,
     finished: bool,
+    display_name: String,
 }
 
 impl CliProgress {
@@ -23,18 +24,21 @@ impl CliProgress {
             "{spinner:.green} {msg}{wide_bar:.cyan/blue} {pos:>7}/{len:>7} ({eta})",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar());
-        let mut progress = Self {
-            bar,
-            total: None,
-            finished: false,
-        };
-        let name = input
+        let display_name = input
             .file_name()
             .and_then(|s| s.to_str())
             .map(|s| s.to_owned())
             .unwrap_or_else(|| input.to_string_lossy().into_owned());
-        progress.bar.set_message(format!("Splitting {name} "));
+        let mut progress = Self {
+            bar,
+            total: None,
+            finished: false,
+            display_name,
+        };
         progress.bar.set_style(style);
+        progress
+            .bar
+            .set_message(format!("Splitting {} ", progress.display_name));
         progress
     }
 }
@@ -54,6 +58,16 @@ impl ProgressReporter for CliProgress {
             if total_ms > 0 {
                 self.bar.set_length(total_ms);
             }
+            if let Some(duration) = total {
+                self.bar.set_message(format!(
+                    "Splitting {} ({}) ",
+                    self.display_name,
+                    HumanDuration(duration)
+                ));
+            }
+        } else {
+            self.bar
+                .set_message(format!("Splitting {} ", self.display_name));
         }
     }
 
@@ -63,7 +77,8 @@ impl ProgressReporter for CliProgress {
             self.bar.set_position(position);
         } else {
             self.bar.set_message(format!(
-                "Splitting (processed {}) ",
+                "Splitting {} (processed {}) ",
+                self.display_name,
                 HumanDuration(processed)
             ));
             self.bar.tick();
