@@ -35,13 +35,21 @@ Pull requests that fail these checks cannot be merged. If you introduce new tool
 
 ## Benchmarks
 
-Benchmarks live under `audiosplit_core/benches` and use generated audio fixtures so no binary assets are required. Run them with:
+Benchmarks live under `audiosplit_core/benches` and use [Criterion.rs](https://bheisler.github.io/criterion.rs/book/) for measuring performance. The `split_benchmark` target synthesizes short WAV fixtures on the fly, so no binary assets need to be checked in.
+
+Run all benchmarks with:
 
 ```bash
 cargo bench -p audiosplit_core
 ```
 
-The benchmark harness synthesizes WAV data on the fly, so no additional setup is necessary beyond having the Rust toolchain installed.
+You can also focus on the split benchmark specifically:
+
+```bash
+cargo bench -p audiosplit_core split_benchmark
+```
+
+Ensure you have the Rust toolchain installed; Criterion will handle warmup and sampling automatically.
 
 ## Reporting Issues
 
