@@ -1,7 +1,7 @@
 use audiosplit_core::{run, run_with_metrics, AudioSplitError, Config, ProgressReporter};
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
@@ -51,6 +51,25 @@ fn write_test_tone<P: AsRef<Path>>(
     file.write_all(&data_len.to_le_bytes())?;
     file.write_all(&samples)?;
     Ok(())
+}
+
+fn collect_file_summaries<P: AsRef<Path>>(dir: P) -> Result<Vec<(String, u64)>, Box<dyn Error>> {
+    let mut entries: Vec<_> = fs::read_dir(dir)?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    entries.sort();
+
+    let mut summaries = Vec::with_capacity(entries.len());
+    for path in entries {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 file name"))?;
+        let size = fs::metadata(&path)?.len();
+        summaries.push((name.to_owned(), size));
+    }
+
+    Ok(summaries)
 }
 
 #[test]
@@ -193,6 +212,7 @@ fn run_limits_buffer_size_usage() -> Result<(), Box<dyn Error>> {
     )
     .buffer_size_frames(buffer_frames)
     .write_buffer_samples(write_buffer_samples)
+    .threads(NonZeroUsize::new(1).expect("non-zero"))
     .build()?;
 
     let mut progress = SilentProgress;
@@ -222,6 +242,45 @@ fn run_limits_buffer_size_usage() -> Result<(), Box<dyn Error>> {
     );
 
     output_dir.close()?;
+    work_dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn run_parallel_produces_same_results_as_serial() -> Result<(), Box<dyn Error>> {
+    let work_dir = tempdir()?;
+    let input_path = work_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 2_000, 1)?;
+
+    let serial_dir = tempdir()?;
+    let parallel_dir = tempdir()?;
+
+    let serial_config = Config::builder(
+        &input_path,
+        serial_dir.path(),
+        Duration::from_millis(400),
+        "part",
+    )
+    .threads(NonZeroUsize::new(1).expect("non-zero"))
+    .build()?;
+    run(serial_config)?;
+
+    let parallel_config = Config::builder(
+        &input_path,
+        parallel_dir.path(),
+        Duration::from_millis(400),
+        "part",
+    )
+    .threads(NonZeroUsize::new(2).expect("non-zero"))
+    .build()?;
+    run(parallel_config)?;
+
+    let serial_summaries = collect_file_summaries(serial_dir.path())?;
+    let parallel_summaries = collect_file_summaries(parallel_dir.path())?;
+    assert_eq!(serial_summaries, parallel_summaries);
+
+    parallel_dir.close()?;
+    serial_dir.close()?;
     work_dir.close()?;
     Ok(())
 }

@@ -14,6 +14,7 @@ use std::mem;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal, SignalSpec};
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
@@ -36,6 +37,8 @@ pub const OPTIMAL_WRITE_BUFFER_SAMPLES: usize = OPTIMAL_DECODE_BUFFER_FRAMES * 2
 pub const DEFAULT_BUFFER_FRAMES: usize = OPTIMAL_DECODE_BUFFER_FRAMES;
 /// Backwards-compatible alias for consumers expecting the write buffer constant.
 pub const DEFAULT_WRITE_BUFFER_SAMPLES: usize = OPTIMAL_WRITE_BUFFER_SAMPLES;
+/// Maximum number of threads allowed when parallelising encoding work.
+pub const MAX_THREADS: usize = 32;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// Trait used to relay progress information while splitting audio files.
@@ -194,7 +197,8 @@ pub enum SegmentLengthError {
 /// Configuration for the audio splitting operation.
 ///
 /// The configuration ensures paths are canonicalized prior to processing and
-/// stores the segment length and filename postfix used during splitting.
+/// stores the segment length, filename postfix, and desired degree of parallelism
+/// used during splitting.
 ///
 /// # Examples
 ///
@@ -214,6 +218,7 @@ pub enum SegmentLengthError {
 /// let config = Config::new(&input, &output_dir, Duration::from_secs(1), "part")?;
 /// assert_eq!(config.segment_length, Duration::from_secs(1));
 /// assert_eq!(config.postfix, "part");
+/// assert_eq!(config.threads.get(), 1);
 /// # Ok(())
 /// # }
 /// ```
@@ -233,6 +238,8 @@ pub struct Config {
     pub buffer_size_frames: NonZeroUsize,
     /// Maximum number of interleaved samples buffered before writing to disk.
     pub write_buffer_samples: NonZeroUsize,
+    /// Number of worker threads available for encoding. A value of one performs serial encoding.
+    pub threads: NonZeroUsize,
 }
 
 impl Config {
@@ -304,6 +311,7 @@ pub struct ConfigBuilder {
     create_output_dir: bool,
     buffer_size_frames: NonZeroUsize,
     write_buffer_samples: NonZeroUsize,
+    threads: NonZeroUsize,
 }
 
 impl ConfigBuilder {
@@ -325,6 +333,7 @@ impl ConfigBuilder {
                 .expect("default buffer size must be non-zero"),
             write_buffer_samples: NonZeroUsize::new(DEFAULT_WRITE_BUFFER_SAMPLES)
                 .expect("default write buffer size must be non-zero"),
+            threads: NonZeroUsize::new(1).expect("default thread count must be non-zero"),
         }
     }
 
@@ -352,6 +361,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Configure the number of worker threads to use when encoding segments.
+    pub fn threads(mut self, threads: NonZeroUsize) -> Self {
+        self.threads = threads;
+        self
+    }
+
     /// Finalize the builder, validating paths and constructing the [`Config`].
     pub fn build(self) -> Result<Config, AudioSplitError> {
         validate_segment_length(self.segment_length)?;
@@ -368,6 +383,7 @@ impl ConfigBuilder {
             allow_overwrite: self.overwrite,
             buffer_size_frames: self.buffer_size_frames,
             write_buffer_samples: self.write_buffer_samples,
+            threads: self.threads,
         })
     }
 }
@@ -897,6 +913,7 @@ fn run_internal<P: ProgressReporter>(
         pad_width,
         segment_length_frames,
         sample_rate,
+        config.threads.get(),
     );
 
     let metrics = splitter.run(reader, decoder, progress)?;
@@ -919,6 +936,7 @@ struct StreamingSplitter<'exec, 'recorder, 'cfg> {
     sample_rate: u64,
     buffer_size_frames: usize,
     write_buffer_samples: usize,
+    threads: usize,
     frames_in_segment: u64,
     segment_index: u64,
     total_frames_processed: u64,
@@ -938,6 +956,7 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         pad_width: usize,
         segment_length_frames: u64,
         sample_rate: u64,
+        threads: usize,
     ) -> Self {
         Self {
             execution,
@@ -949,6 +968,7 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             sample_rate,
             buffer_size_frames: config.buffer_size_frames.get(),
             write_buffer_samples: config.write_buffer_samples.get(),
+            threads,
             frames_in_segment: 0,
             segment_index: 0,
             total_frames_processed: 0,
@@ -1009,7 +1029,7 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         progress: &mut P,
     ) -> Result<(), AudioSplitError>
     where
-        S: Sample + Copy,
+        S: Sample + Copy + Send + Sync,
         i16: FromSample<S>,
         P: ProgressReporter,
     {
@@ -1048,22 +1068,33 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             self.peak_frames_per_chunk = self.peak_frames_per_chunk.max(frames_to_take);
 
             let required_samples = frames_to_take * channel_count;
-            if self.work_buffer.capacity() < required_samples {
-                self.work_buffer
-                    .reserve(required_samples - self.work_buffer.capacity());
-            }
-            self.work_buffer.clear();
-
-            for frame in frame_index..frame_index + frames_to_take {
-                for channel_slice in &channel_slices {
-                    let sample = channel_slice[frame];
-                    self.work_buffer.push(i16::from_sample(sample));
-                }
+            let mut samples = mem::take(&mut self.work_buffer);
+            if samples.capacity() < required_samples {
+                samples.reserve(required_samples - samples.capacity());
             }
 
-            self.peak_samples_per_chunk = self.peak_samples_per_chunk.max(self.work_buffer.len());
+            let start_frame = frame_index;
+            samples.resize(required_samples, 0);
+            if self.threads > 1 {
+                self.fill_samples_parallel(
+                    &channel_slices,
+                    start_frame,
+                    frames_to_take,
+                    channel_count,
+                    &mut samples,
+                );
+            } else {
+                Self::fill_samples_serial(
+                    &channel_slices,
+                    start_frame,
+                    frames_to_take,
+                    channel_count,
+                    &mut samples,
+                );
+            }
 
-            let samples = mem::take(&mut self.work_buffer);
+            self.peak_samples_per_chunk = self.peak_samples_per_chunk.max(samples.len());
+
             self.write_samples(spec, channel_count, frames_to_take as u64, &samples)?;
             self.work_buffer = samples;
             self.work_buffer.clear();
@@ -1076,6 +1107,83 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         let processed_duration = frames_to_duration(self.total_frames_processed, self.sample_rate);
         progress.update(processed_duration);
         Ok(())
+    }
+
+    fn fill_samples_parallel<S>(
+        &self,
+        channel_slices: &[&[S]],
+        start_frame: usize,
+        frames_to_take: usize,
+        channel_count: usize,
+        output: &mut [i16],
+    ) where
+        S: Sample + Copy + Send + Sync,
+        i16: FromSample<S>,
+    {
+        if frames_to_take == 0 {
+            return;
+        }
+
+        let threads = self.threads.max(1).min(frames_to_take);
+        if threads <= 1 {
+            Self::fill_samples_serial(
+                channel_slices,
+                start_frame,
+                frames_to_take,
+                channel_count,
+                output,
+            );
+            return;
+        }
+
+        let mut remaining = output;
+        let mut frame_offset = 0usize;
+        let mut frames_remaining = frames_to_take;
+
+        thread::scope(|scope| {
+            for i in 0..threads {
+                let threads_left = threads - i;
+                let chunk_frames = (frames_remaining + threads_left - 1) / threads_left;
+                let split_index = chunk_frames * channel_count;
+                let (chunk_slice, rest) = remaining.split_at_mut(split_index);
+                remaining = rest;
+                let chunk_start = start_frame + frame_offset;
+
+                scope.spawn(move || {
+                    Self::fill_samples_serial(
+                        channel_slices,
+                        chunk_start,
+                        chunk_frames,
+                        channel_count,
+                        chunk_slice,
+                    );
+                });
+
+                frame_offset += chunk_frames;
+                frames_remaining -= chunk_frames;
+            }
+        });
+    }
+
+    fn fill_samples_serial<S>(
+        channel_slices: &[&[S]],
+        start_frame: usize,
+        frames_to_take: usize,
+        channel_count: usize,
+        output: &mut [i16],
+    ) where
+        S: Sample + Copy,
+        i16: FromSample<S>,
+    {
+        for (offset, chunk) in output.chunks_mut(channel_count).enumerate() {
+            if offset >= frames_to_take {
+                break;
+            }
+            let frame = start_frame + offset;
+            for (channel, sample_slot) in chunk.iter_mut().enumerate() {
+                *sample_slot = i16::from_sample(channel_slices[channel][frame]);
+            }
+        }
     }
 
     fn write_samples(

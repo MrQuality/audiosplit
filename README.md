@@ -8,6 +8,7 @@ AudioSplit is a command-line tool for splitting long audio recordings into unifo
 - Configure the segment duration with readable strings such as `30s`, `1h30m`, or `0.5d` for precise control over output length.
 - Choose the destination directory where resulting files are written.
 - Customize the filename postfix added between the base name and the segment counter.
+- Control the number of worker threads used for encoding to match your system resources.
 - Receive clear error messages when the input file cannot be processed.
 
 ## Installation
@@ -46,6 +47,9 @@ Options:
           Directory where the split tracks will be written
   -p, --postfix <POSTFIX>
           Postfix inserted into generated file names [default: part]
+      --threads <THREADS>
+          Number of worker threads to use when encoding segments [default: 1] [possible
+          values: 1..=32]
   -h, --help
           Print help
   -V, --version

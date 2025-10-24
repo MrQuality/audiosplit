@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use audiosplit_core::MAX_THREADS;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
@@ -194,6 +195,60 @@ fn cli_creates_missing_output_directory_when_allowed() -> Result<(), Box<dyn Err
 
     base_dir.close()?;
     input_dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn cli_accepts_threads_argument() -> Result<(), Box<dyn Error>> {
+    let input_dir = tempdir()?;
+    let input_path = input_dir.path().join("input.wav");
+    write_test_tone(&input_path, 8_000, 1_100)?;
+
+    let output_dir = tempdir()?;
+    let output_arg = output_dir.path().to_string_lossy().to_string();
+    let input_arg = input_path.to_string_lossy().to_string();
+
+    let mut cmd = Command::cargo_bin("audiosplit")?;
+    cmd.args([
+        "--length",
+        "400ms",
+        "--output",
+        &output_arg,
+        "--threads",
+        "2",
+    ])
+    .arg(&input_arg);
+    cmd.assert().success();
+
+    output_dir.close()?;
+    input_dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn cli_rejects_out_of_range_threads() -> Result<(), Box<dyn Error>> {
+    let mut cmd = Command::cargo_bin("audiosplit")?;
+    let invalid = (MAX_THREADS + 1).to_string();
+    let assert = cmd
+        .args([
+            "--length",
+            "1s",
+            "--output",
+            ".",
+            "--threads",
+            &invalid,
+            "dummy.wav",
+        ])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8(assert.stderr().to_vec())?;
+    assert!(
+        stderr.contains("--threads <THREADS>"),
+        "unexpected error message: {}",
+        stderr
+    );
+
     Ok(())
 }
 
