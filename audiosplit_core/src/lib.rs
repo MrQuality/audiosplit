@@ -913,7 +913,6 @@ fn run_internal<P: ProgressReporter>(
         pad_width,
         segment_length_frames,
         sample_rate,
-        config.threads.get(),
     );
 
     let metrics = splitter.run(reader, decoder, progress)?;
@@ -956,7 +955,6 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         pad_width: usize,
         segment_length_frames: u64,
         sample_rate: u64,
-        threads: usize,
     ) -> Self {
         Self {
             execution,
@@ -968,7 +966,7 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
             sample_rate,
             buffer_size_frames: config.buffer_size_frames.get(),
             write_buffer_samples: config.write_buffer_samples.get(),
-            threads,
+            threads: config.threads.get(),
             frames_in_segment: 0,
             segment_index: 0,
             total_frames_processed: 0,
@@ -1143,7 +1141,11 @@ impl<'exec, 'recorder, 'cfg> StreamingSplitter<'exec, 'recorder, 'cfg> {
         thread::scope(|scope| {
             for i in 0..threads {
                 let threads_left = threads - i;
-                let chunk_frames = (frames_remaining + threads_left - 1) / threads_left;
+                debug_assert!(
+                    threads_left > 0,
+                    "chunk division requires non-zero threads_left"
+                );
+                let chunk_frames = frames_remaining.div_ceil(threads_left);
                 let split_index = chunk_frames * channel_count;
                 let (chunk_slice, rest) = remaining.split_at_mut(split_index);
                 remaining = rest;

@@ -90,7 +90,7 @@ pub fn build_cli() -> Command {
                 .value_name("THREADS")
                 .help("Number of worker threads to use when encoding segments")
                 .default_value(DEFAULT_THREADS_STR)
-                .value_parser(value_parser!(usize).range(1..=MAX_THREADS)),
+                .value_parser(ValueParser::new(parse_thread_count)),
         )
         .arg(
             Arg::new("overwrite")
@@ -111,4 +111,19 @@ pub fn build_cli() -> Command {
                 .required(true)
                 .value_parser(value_parser!(PathBuf)),
         )
+}
+
+fn parse_thread_count(arg: &str) -> Result<usize, String> {
+    let value = arg
+        .parse::<usize>()
+        .map_err(|err| format!("invalid thread count: {err}"))?;
+
+    if (1..=MAX_THREADS).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "thread count must be between 1 and {} (received {value})",
+            MAX_THREADS
+        ))
+    }
 }
