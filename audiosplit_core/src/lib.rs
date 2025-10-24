@@ -388,13 +388,19 @@ impl ConfigBuilder {
         let input_path = canonicalize_existing_file(&self.input)?;
         let output_dir = prepare_output_directory(&self.output, self.create_output_dir)?;
         check_write_permission(&output_dir)?;
-        enforce_overwrite_rules(&output_dir, &input_path, &self.postfix, self.overwrite)?;
+        let sanitized_postfix = sanitize_filename(&self.postfix);
+        enforce_overwrite_rules(
+            &output_dir,
+            &input_path,
+            &sanitized_postfix,
+            self.overwrite,
+        )?;
 
         Ok(Config {
             input_path,
             output_dir,
             segment_length: self.segment_length,
-            postfix: self.postfix,
+            postfix: sanitized_postfix,
             allow_overwrite: self.overwrite,
             buffer_size_frames: self.buffer_size_frames,
             write_buffer_samples: self.write_buffer_samples,
@@ -593,6 +599,7 @@ fn enforce_overwrite_rules(
         return Ok(());
     };
 
+    let base_name = sanitize_filename(base_name);
     let prefix = format!("{base_name}_{postfix}_");
     let suffix = format!(".{extension}");
 
@@ -905,6 +912,7 @@ fn run_internal<P: ProgressReporter>(
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or(AudioSplitError::InvalidInputName)?;
+    let base_name = sanitize_filename(base_name);
     let base_name = base_name.to_owned();
     let extension = config
         .input_path
@@ -1373,8 +1381,12 @@ fn plan_segment_path(params: &WriterParams) -> Result<PathBuf, AudioSplitError> 
         params.base_name, params.config.postfix, padded_index, params.extension
     );
 
+    debug_assert!(params.config.output_dir.is_absolute());
+
     let mut output_path = params.config.output_dir.clone();
     output_path.push(file_name);
+
+    debug_assert!(output_path.is_absolute());
 
     if !output_path.starts_with(&params.config.output_dir) {
         return Err(AudioSplitError::InvalidPath(output_path));
@@ -1383,6 +1395,42 @@ fn plan_segment_path(params: &WriterParams) -> Result<PathBuf, AudioSplitError> 
     ensure_output_dir_present(&params.config.output_dir)?;
 
     Ok(output_path)
+}
+
+/// Sanitize a user-controlled filename fragment to avoid directory traversal.
+///
+/// The sanitizer replaces any platform path separators or repeated dot
+/// sequences with underscores, ensuring the generated file names cannot escape
+/// the canonical output directory. The function always returns at least a
+/// single underscore when the input collapses entirely.
+fn sanitize_filename(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '/' | '\\') {
+            sanitized.push('_');
+            continue;
+        }
+
+        if ch == '.' {
+            if matches!(chars.peek(), Some('.')) {
+                while matches!(chars.peek(), Some('.')) {
+                    chars.next();
+                }
+                sanitized.push('_');
+                continue;
+            }
+        }
+
+        sanitized.push(ch);
+    }
+
+    if sanitized.is_empty() {
+        sanitized.push('_');
+    }
+
+    sanitized
 }
 
 fn prepare_segment_target(
@@ -1656,6 +1704,7 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use std::io::Write;
+    use symphonia::core::audio::Channels;
     use tempfile::tempdir;
 
     #[test]
@@ -1925,6 +1974,77 @@ mod tests {
             AudioSplitError::InvalidPath(path) => assert_eq!(path, output_file),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_traversal_sequences() {
+        let sanitized = sanitize_filename("..//evil\\name");
+        assert_eq!(sanitized, "___evil_name");
+        assert!(!sanitized.contains(".."));
+        assert!(!sanitized.contains('/'));
+        assert!(!sanitized.contains('\\'));
+    }
+
+    #[test]
+    fn config_builder_sanitizes_postfix_input() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("input.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = temp_dir.path().join("segments");
+        fs::create_dir_all(&output_dir).expect("create output directory");
+
+        let config = Config::builder(
+            &input_path,
+            &output_dir,
+            Duration::from_secs(1),
+            "..//malicious\\suffix..",
+        )
+        .build()
+        .expect("config should sanitize postfix");
+
+        assert!(!config.postfix.contains(".."));
+        assert!(!config.postfix.contains('/'));
+        assert!(!config.postfix.contains('\\'));
+    }
+
+    #[test]
+    fn plan_segment_path_never_escapes_output_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let input_path = temp_dir.path().join("..evil.wav");
+        File::create(&input_path).expect("create input file");
+
+        let output_dir = temp_dir.path().join("segments");
+        fs::create_dir_all(&output_dir).expect("create output directory");
+
+        let config = Config::builder(
+            &input_path,
+            &output_dir,
+            Duration::from_secs(1),
+            "..//malicious\\suffix",
+        )
+        .build()
+        .expect("config should sanitize paths");
+
+        let base_name = sanitize_filename("..evil");
+        let params = WriterParams {
+            config: &config,
+            base_name: &base_name,
+            extension: "wav",
+            pad_width: 3,
+            segment_index: 1,
+            signal_spec: SignalSpec::new(48_000, Channels::FRONT_LEFT),
+        };
+
+        let planned = plan_segment_path(&params).expect("plan path");
+        assert!(planned.starts_with(&config.output_dir));
+        let file_name = planned
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("valid utf-8 filename");
+        assert!(!file_name.contains(".."));
+        assert!(!file_name.contains('/'));
+        assert!(!file_name.contains('\\'));
     }
 
     #[test]

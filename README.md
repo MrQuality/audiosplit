@@ -66,6 +66,15 @@ audiosplit --length 30s --output segments --postfix chapter meeting.mp3
 
 The command above will create output files named similar to `meeting.chapter.001.mp3` inside the `segments/` directory.
 
+## Security considerations
+
+- AudioSplit canonicalizes the destination directory and sanitizes the input
+  file stem and the `--postfix` argument before constructing output paths.
+- Path separators and `..` traversal sequences are replaced with underscores to
+  ensure generated segment names cannot escape the selected directory.
+- The tool verifies write permissions using a throwaway file to detect
+  permission or disk-space issues before encoding begins.
+
 ### Duration format
 
 Duration strings accepted by `--length` follow the grammar below:
