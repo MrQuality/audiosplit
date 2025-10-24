@@ -1408,14 +1408,12 @@ fn sanitize_filename(input: &str) -> String {
             continue;
         }
 
-        if ch == '.' {
-            if matches!(chars.peek(), Some('.')) {
-                while matches!(chars.peek(), Some('.')) {
-                    chars.next();
-                }
-                sanitized.push('_');
-                continue;
+        if ch == '.' && matches!(chars.peek(), Some('.')) {
+            while matches!(chars.peek(), Some('.')) {
+                chars.next();
             }
+            sanitized.push('_');
+            continue;
         }
 
         sanitized.push(ch);
