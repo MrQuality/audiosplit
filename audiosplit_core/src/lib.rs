@@ -1491,8 +1491,7 @@ impl SegmentEncoder {
             let result = match pending {
                 PendingResult::Immediate(result) => result,
                 PendingResult::Receiver(receiver) => receiver.recv().unwrap_or_else(|_| {
-                    Err(AudioSplitError::Io(io::Error::new(
-                        io::ErrorKind::Other,
+                    Err(AudioSplitError::Io(io::Error::other(
                         "encoder worker channel closed unexpectedly",
                     )))
                 }),
@@ -1558,8 +1557,7 @@ impl ThreadPool {
         self.sender
             .send(PoolMessage::Task(task, sender))
             .map_err(|err| {
-                AudioSplitError::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                AudioSplitError::Io(io::Error::other(
                     format!("failed to schedule encoding task: {err}"),
                 ))
             })?;
@@ -1569,8 +1567,7 @@ impl ThreadPool {
     fn shutdown(&mut self) -> Result<(), AudioSplitError> {
         for _ in &self.handles {
             self.sender.send(PoolMessage::Shutdown).map_err(|err| {
-                AudioSplitError::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                AudioSplitError::Io(io::Error::other(
                     format!("failed to signal encoder shutdown: {err}"),
                 ))
             })?;
@@ -1578,8 +1575,7 @@ impl ThreadPool {
 
         for handle in self.handles.drain(..) {
             handle.join().map_err(|_| {
-                AudioSplitError::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                AudioSplitError::Io(io::Error::other(
                     "encoder worker panicked",
                 ))
             })?;
