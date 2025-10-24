@@ -1,4 +1,4 @@
-use audiosplit_core::{DEFAULT_BUFFER_FRAMES, DEFAULT_WRITE_BUFFER_SAMPLES};
+use audiosplit_core::{DEFAULT_BUFFER_FRAMES, DEFAULT_WRITE_BUFFER_SAMPLES, MAX_THREADS};
 use clap::{builder::ValueParser, value_parser, Arg, ArgAction, Command};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ const LENGTH_HELP: &str = concat!(
 pub const DEFAULT_POSTFIX: &str = "part";
 const DEFAULT_BUFFER_FRAMES_STR: &str = "4096";
 const DEFAULT_WRITE_BUFFER_SAMPLES_STR: &str = "8192";
+const DEFAULT_THREADS_STR: &str = "1";
 
 pub fn build_cli() -> Command {
     debug_assert_eq!(
@@ -29,6 +30,12 @@ pub fn build_cli() -> Command {
             .parse::<usize>()
             .expect("valid write buffer default"),
         DEFAULT_WRITE_BUFFER_SAMPLES
+    );
+    debug_assert_eq!(
+        DEFAULT_THREADS_STR
+            .parse::<usize>()
+            .expect("valid thread default"),
+        1
     );
 
     Command::new(env!("CARGO_PKG_NAME"))
@@ -78,6 +85,14 @@ pub fn build_cli() -> Command {
                 .default_value(DEFAULT_WRITE_BUFFER_SAMPLES_STR),
         )
         .arg(
+            Arg::new("threads")
+                .long("threads")
+                .value_name("THREADS")
+                .help("Number of worker threads to use when encoding segments")
+                .default_value(DEFAULT_THREADS_STR)
+                .value_parser(ValueParser::new(parse_thread_count)),
+        )
+        .arg(
             Arg::new("overwrite")
                 .long("overwrite")
                 .help("Allow overwriting existing files in the output directory")
@@ -96,4 +111,19 @@ pub fn build_cli() -> Command {
                 .required(true)
                 .value_parser(value_parser!(PathBuf)),
         )
+}
+
+fn parse_thread_count(arg: &str) -> Result<usize, String> {
+    let value = arg
+        .parse::<usize>()
+        .map_err(|err| format!("invalid thread count: {err}"))?;
+
+    if (1..=MAX_THREADS).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "thread count must be between 1 and {} (received {value})",
+            MAX_THREADS
+        ))
+    }
 }
