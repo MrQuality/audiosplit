@@ -1,6 +1,7 @@
 use std::f32::consts::TAU;
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -91,6 +92,7 @@ fn write_wav_pcm_i16(
 struct Scenario {
     name: &'static str,
     segment_length: Duration,
+    threads: NonZeroUsize,
 }
 
 fn split_benchmarks(c: &mut Criterion) {
@@ -99,16 +101,19 @@ fn split_benchmarks(c: &mut Criterion) {
 
     let scenarios = [
         Scenario {
-            name: "segments_1s",
+            name: "segments_1s_serial",
             segment_length: Duration::from_secs(1),
+            threads: NonZeroUsize::new(1).expect("thread count must be non-zero"),
         },
         Scenario {
-            name: "segments_5s",
+            name: "segments_5s_parallel",
             segment_length: Duration::from_secs(5),
+            threads: NonZeroUsize::new(4).expect("thread count must be non-zero"),
         },
         Scenario {
-            name: "segments_10s",
+            name: "segments_10s_parallel",
             segment_length: Duration::from_secs(10),
+            threads: NonZeroUsize::new(4).expect("thread count must be non-zero"),
         },
     ];
 
@@ -117,16 +122,21 @@ fn split_benchmarks(c: &mut Criterion) {
     for scenario in scenarios {
         group.bench_with_input(
             BenchmarkId::from_parameter(scenario.name),
-            &scenario.segment_length,
-            |b, &segment_length| {
+            &scenario,
+            |b, scenario| {
                 b.iter_batched(
                     || {
                         let output = tempfile::tempdir().expect("failed to create output dir");
-                        let config =
-                            Config::builder(fixture.path(), output.path(), segment_length, "bench")
-                                .overwrite(true)
-                                .build()
-                                .expect("failed to build config");
+                        let config = Config::builder(
+                            fixture.path(),
+                            output.path(),
+                            scenario.segment_length,
+                            "bench",
+                        )
+                        .overwrite(true)
+                        .threads(scenario.threads)
+                        .build()
+                        .expect("failed to build config");
                         (config, output)
                     },
                     |(config, _output)| {
