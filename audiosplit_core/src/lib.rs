@@ -389,12 +389,7 @@ impl ConfigBuilder {
         let output_dir = prepare_output_directory(&self.output, self.create_output_dir)?;
         check_write_permission(&output_dir)?;
         let sanitized_postfix = sanitize_filename(&self.postfix);
-        enforce_overwrite_rules(
-            &output_dir,
-            &input_path,
-            &sanitized_postfix,
-            self.overwrite,
-        )?;
+        enforce_overwrite_rules(&output_dir, &input_path, &sanitized_postfix, self.overwrite)?;
 
         Ok(Config {
             input_path,
