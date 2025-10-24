@@ -1557,9 +1557,9 @@ impl ThreadPool {
         self.sender
             .send(PoolMessage::Task(task, sender))
             .map_err(|err| {
-                AudioSplitError::Io(io::Error::other(
-                    format!("failed to schedule encoding task: {err}"),
-                ))
+                AudioSplitError::Io(io::Error::other(format!(
+                    "failed to schedule encoding task: {err}"
+                )))
             })?;
         Ok(receiver)
     }
@@ -1567,18 +1567,16 @@ impl ThreadPool {
     fn shutdown(&mut self) -> Result<(), AudioSplitError> {
         for _ in &self.handles {
             self.sender.send(PoolMessage::Shutdown).map_err(|err| {
-                AudioSplitError::Io(io::Error::other(
-                    format!("failed to signal encoder shutdown: {err}"),
-                ))
+                AudioSplitError::Io(io::Error::other(format!(
+                    "failed to signal encoder shutdown: {err}"
+                )))
             })?;
         }
 
         for handle in self.handles.drain(..) {
-            handle.join().map_err(|_| {
-                AudioSplitError::Io(io::Error::other(
-                    "encoder worker panicked",
-                ))
-            })?;
+            handle
+                .join()
+                .map_err(|_| AudioSplitError::Io(io::Error::other("encoder worker panicked")))?;
         }
 
         Ok(())
